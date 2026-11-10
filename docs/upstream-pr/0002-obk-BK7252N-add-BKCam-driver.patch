@@ -1,0 +1,457 @@
+From d0c19c3160754d705e82ad29721dc431bb7fa031 Mon Sep 17 00:00:00 2001
+From: im486dx <im486dx@gmail.com>
+Date: Mon, 9 Nov 2026 19:33:40 +0400
+Subject: [PATCH] BK7252N: add BKCam driver (DVP camera, JPEG snapshot and
+ MJPEG stream)
+
+New driver for the BK7252N's DVP camera interface and JPEG encoder:
+
+- /snapshot.jpg  newest frame as image/jpeg
+- /stream        MJPEG (multipart/x-mixed-replace), for browsers, VLC and
+                 Android MJPEG viewers
+- /cam           small viewer page; the main page links to it
+- commands CamStart, CamStop, CamInfo, CamReg <reg> [value], and CamDump
+  (prints a frame as hex on the console UART, for bring-up without Wi-Fi)
+
+The SDK's camera_intf does the hardware part: sensor clock and DVP pins,
+sensor init over I2C1, encoder and GDMA. The driver copies the GDMA chunks
+of each frame into one of three 48 KB buffers, trims the frame to its EOI
+marker, and serves the newest complete frame while capture continues.
+
+Enable it with `startDriver BKCam` (for example as the startup command).
+
+Requires the beken_freertos_sdk change that builds camera_intf on BK7252N
+and adds GC0329 support; the sdk/beken_freertos_sdk submodule must be
+bumped to it.
+
+Tested on a BK7252N battery camera with a GC0329C sensor: 640x480 at
+10 fps, ~9 KB per frame, streamed over Wi-Fi in AP and STA mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N5nR5M1QDLE8VphuUB9JX4
+---
+ platforms/obk_main.mk  |   1 +
+ src/driver/drv_bkCam.c | 343 +++++++++++++++++++++++++++++++++++++++++
+ src/driver/drv_local.h |   3 +
+ src/driver/drv_main.c  |  16 ++
+ src/obk_config.h       |   1 +
+ 5 files changed, 364 insertions(+)
+ create mode 100644 src/driver/drv_bkCam.c
+
+diff --git a/platforms/obk_main.mk b/platforms/obk_main.mk
+index 1676085..4e9809d 100644
+--- a/platforms/obk_main.mk
++++ b/platforms/obk_main.mk
+@@ -82,6 +82,7 @@ OBKM_SRC  += $(OBK_SRCS)driver/drv_adcButton.c
+ OBKM_SRC  += $(OBK_SRCS)driver/drv_adcSmoother.c
+ OBKM_SRC  += $(OBK_SRCS)driver/drv_aht2x.c
+ OBKM_SRC  += $(OBK_SRCS)driver/drv_bkCharge.c
++OBKM_SRC  += $(OBK_SRCS)driver/drv_bkCam.c
+ OBKM_SRC  += $(OBK_SRCS)driver/drv_battery.c
+ OBKM_SRC  += $(OBK_SRCS)driver/drv_bl0937.c
+ OBKM_SRC  += $(OBK_SRCS)driver/drv_bl0942.c
+diff --git a/src/driver/drv_bkCam.c b/src/driver/drv_bkCam.c
+new file mode 100644
+index 0000000..3cefe16
+--- /dev/null
++++ b/src/driver/drv_bkCam.c
+@@ -0,0 +1,343 @@
++// BK7252N DVP camera (tested with a GC0329 sensor): JPEG frames from the on-chip encoder,
++// served as /snapshot.jpg, an MJPEG /stream and a /cam page.
++//
++// Beken's camera_intf (SDK func/camera_intf) does the hardware part: sensor clock and DVP pins,
++// I2C1 sensor init, JPEG encoder and the GDMA that drains it. It hands us the JPEG stream in
++// node_len chunks (node_full_handler, from interrupt context) and flags the last chunk of a frame
++// with is_eof. Chunks are copied into one of CAM_NBUF frame buffers; a finished frame becomes the
++// "ready" buffer and HTTP clients send from it while capture continues into another one.
++#include "../obk_config.h"
++
++#if ENABLE_DRIVER_BKCAM
++
++#include "../new_common.h"
++#include "../cmnds/cmd_public.h"
++#include "../httpserver/new_http.h"
++#include "../logging/logging.h"
++#include "drv_local.h"
++
++#include "include.h"
++#include "arm_arch.h"
++#include "rtos_pub.h"
++#include "mem_pub.h"
++#include "video_transfer.h"
++#include "camera_intf_pub.h"
++#include "lwip/sockets.h"
++
++#define CAM_NODE_LEN    1024
++#define CAM_RXBUF_LEN   (CAM_NODE_LEN * 8)
++#define CAM_FRAME_MAX   (48 * 1024)       // encoder targets <= 35 KB at VGA
++#define CAM_NBUF        3
++
++extern UINT32 camera_intfer_get_senser_reg(UINT16 addr, UINT8 *data);
++extern UINT32 camera_intfer_set_senser_reg(UINT16 addr, UINT8 data);
++
++static UINT8 *g_rx;
++static UINT8 *g_buf[CAM_NBUF];
++static volatile UINT32 g_len[CAM_NBUF];
++static volatile int g_wr = 0;             // buffer being filled
++static volatile int g_ready = -1;         // last complete frame
++static volatile UINT32 g_readers[CAM_NBUF];
++static volatile UINT32 g_frame_id = 0;
++static volatile UINT32 g_overflow = 0, g_badframe = 0, g_chunks = 0;
++static volatile UINT32 g_wpos = 0;
++static int g_running = 0;
++static TVIDEO_DESC_ST g_desc;
++
++static int Cam_PickWriteBuf(void)
++{
++	for (int i = 0; i < CAM_NBUF; i++)
++		if (i != g_ready && g_readers[i] == 0)
++			return i;
++	return -1;
++}
++
++// Interrupt context (GDMA chunk done / end-of-frame timer).
++static void Cam_NodeHandler(void *curptr, UINT32 newlen, UINT32 is_eof, UINT32 frame_len)
++{
++	g_chunks++;
++	if (g_wr < 0) {
++		g_wr = Cam_PickWriteBuf();
++		g_wpos = 0;
++		if (g_wr < 0)
++			return;   // every buffer busy: drop this frame
++	}
++	if (g_wpos + newlen <= CAM_FRAME_MAX) {
++		os_memcpy(g_buf[g_wr] + g_wpos, curptr, newlen);
++		g_wpos += newlen;
++	} else {
++		g_overflow++;
++		g_wpos = CAM_FRAME_MAX + 1;
++	}
++	if (!is_eof)
++		return;
++
++	UINT8 *b = g_buf[g_wr];
++	UINT32 n = g_wpos;
++	int ok = (n <= CAM_FRAME_MAX && n > 4 && b[0] == 0xFF && b[1] == 0xD8);
++	if (ok) {
++		// trim to the EOI marker (the encoder appends a 4-byte size word and DMA padding)
++		UINT32 e = n;
++		while (e >= 2 && !(b[e - 2] == 0xFF && b[e - 1] == 0xD9))
++			e--;
++		ok = e >= 2;
++		n = e;
++	}
++	if (ok) {
++		g_len[g_wr] = n;
++		g_ready = g_wr;
++		g_frame_id++;
++		g_wr = Cam_PickWriteBuf();
++	} else {
++		g_badframe++;
++	}
++	g_wpos = 0;
++}
++
++static void Cam_EndHandler(void) {}
++
++static int Cam_Start(void)
++{
++	if (g_running)
++		return 0;
++	if (!g_rx) {
++		g_rx = (UINT8 *)os_malloc(CAM_RXBUF_LEN);
++		for (int i = 0; i < CAM_NBUF; i++)
++			g_buf[i] = (UINT8 *)os_malloc(CAM_FRAME_MAX);
++		for (int i = 0; i < CAM_NBUF; i++)
++			if (!g_buf[i]) g_rx = NULL;
++		if (!g_rx) {
++			ADDLOG_ERROR(LOG_FEATURE_DRV, "BKCam: out of memory");
++			return -1;
++		}
++	}
++	g_wr = 0; g_wpos = 0; g_ready = -1;
++	os_memset(&g_desc, 0, sizeof(g_desc));
++	g_desc.rxbuf = g_rx;
++	g_desc.rxbuf_len = CAM_RXBUF_LEN;
++	g_desc.node_len = CAM_NODE_LEN;
++	g_desc.node_full_handler = Cam_NodeHandler;
++	g_desc.data_end_handler = Cam_EndHandler;
++	CMPARAM_SET_PPI(g_desc.sener_cfg, VGA_640_480);
++	CMPARAM_SET_FPS(g_desc.sener_cfg, TYPE_10FPS);
++	int r = camera_intfer_init(&g_desc);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam: camera_intfer_init -> %i", r);
++	if (r != 1)
++		return r;
++	g_running = 1;
++	return 0;
++}
++
++static void Cam_Stop(void)
++{
++	if (!g_running)
++		return;
++	camera_intfer_deinit();
++	g_running = 0;
++}
++
++// Takes a reference on the newest frame newer than *last; waits up to timeout_ms.
++static int Cam_Acquire(UINT32 *last, int timeout_ms)
++{
++	for (int t = 0; t <= timeout_ms; t += 10) {
++		GLOBAL_INT_DECLARATION();
++		GLOBAL_INT_DISABLE();
++		int r = g_ready;
++		UINT32 id = g_frame_id;
++		if (r >= 0 && id != *last) {
++			g_readers[r]++;
++			*last = id;
++			GLOBAL_INT_RESTORE();
++			return r;
++		}
++		GLOBAL_INT_RESTORE();
++		rtos_delay_milliseconds(10);
++	}
++	return -1;
++}
++
++static void Cam_Release(int i)
++{
++	GLOBAL_INT_DECLARATION();
++	GLOBAL_INT_DISABLE();
++	if (g_readers[i]) g_readers[i]--;
++	if (g_wr < 0) { g_wr = Cam_PickWriteBuf(); g_wpos = 0; }
++	GLOBAL_INT_RESTORE();
++}
++
++static int Cam_SendAll(int fd, const void *p, int len)
++{
++	const char *c = (const char *)p;
++	while (len > 0) {
++		int n = send(fd, c, len, 0);
++		if (n <= 0)
++			return -1;
++		c += n; len -= n;
++	}
++	return 0;
++}
++
++static int Cam_HttpSnapshot(http_request_t *request)
++{
++	char hdr[160];
++	UINT32 last = 0xFFFFFFFF;
++	if (Cam_Start() != 0) {
++		http_setup(request, httpMimeTypeText);
++		poststr(request, "camera not available");
++		poststr(request, NULL);
++		return 0;
++	}
++	int b = Cam_Acquire(&last, 3000);
++	if (b < 0) {
++		http_setup(request, httpMimeTypeText);
++		poststr(request, "no frame from the camera");
++		poststr(request, NULL);
++		return 0;
++	}
++	int n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
++		"Content-Length: %u\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", (unsigned)g_len[b]);
++	if (Cam_SendAll(request->fd, hdr, n) == 0)
++		Cam_SendAll(request->fd, g_buf[b], g_len[b]);
++	Cam_Release(b);
++	return 0;
++}
++
++#define CAM_BOUNDARY "obkcamframe"
++static int Cam_HttpStream(http_request_t *request)
++{
++	char hdr[160];
++	UINT32 last = 0xFFFFFFFF;
++	if (Cam_Start() != 0)
++		return 0;
++	const char *h = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=" CAM_BOUNDARY
++		"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
++	if (Cam_SendAll(request->fd, h, strlen(h)) != 0)
++		return 0;
++	for (;;) {
++		int b = Cam_Acquire(&last, 3000);
++		if (b < 0)
++			break;
++		int n = snprintf(hdr, sizeof(hdr), "--" CAM_BOUNDARY "\r\nContent-Type: image/jpeg\r\n"
++			"Content-Length: %u\r\n\r\n", (unsigned)g_len[b]);
++		int err = Cam_SendAll(request->fd, hdr, n) || Cam_SendAll(request->fd, g_buf[b], g_len[b])
++			|| Cam_SendAll(request->fd, "\r\n", 2);
++		Cam_Release(b);
++		if (err)
++			break;
++	}
++	return 0;
++}
++
++static int Cam_HttpPage(http_request_t *request)
++{
++	http_setup(request, httpMimeTypeHTML);
++	poststr(request, "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width'>"
++		"<title>Camera</title><style>body{margin:0;background:#111;color:#ccc;font-family:sans-serif}"
++		"img{display:block;width:100%;max-width:640px;margin:0 auto}p{text-align:center}</style></head>"
++		"<body><img src='/stream' alt='camera'><p><a href='/snapshot.jpg' style='color:#8cf'>snapshot</a>"
++		" &middot; <a href='/index' style='color:#8cf'>device</a></p></body></html>");
++	poststr(request, NULL);
++	return 0;
++}
++
++static commandResult_t Cam_Cmd_Start(const void *context, const char *cmd, const char *args, int flags)
++{
++	int r = Cam_Start();
++	ADDLOG_INFO(LOG_FEATURE_CMD, "CamStart: %i", r);
++	return r == 0 ? CMD_RES_OK : CMD_RES_ERROR;
++}
++
++static commandResult_t Cam_Cmd_Stop(const void *context, const char *cmd, const char *args, int flags)
++{
++	Cam_Stop();
++	return CMD_RES_OK;
++}
++
++static commandResult_t Cam_Cmd_Info(const void *context, const char *cmd, const char *args, int flags)
++{
++	ADDLOG_INFO(LOG_FEATURE_CMD, "BKCam: running %i frames %u last %u B chunks %u overflow %u bad %u",
++		g_running, g_frame_id, g_ready >= 0 ? g_len[g_ready] : 0, g_chunks, g_overflow, g_badframe);
++	return CMD_RES_OK;
++}
++
++// CamReg <reg> [value]  (hex or decimal) - read or write a sensor register
++static commandResult_t Cam_Cmd_Reg(const void *context, const char *cmd, const char *args, int flags)
++{
++	Tokenizer_TokenizeString(args, 0);
++	if (Tokenizer_GetArgsCount() < 1)
++		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
++	int reg = Tokenizer_GetArgInteger(0);
++	if (Tokenizer_GetArgsCount() >= 2) {
++		int val = Tokenizer_GetArgInteger(1);
++		camera_intfer_set_senser_reg(reg, val);
++	}
++	UINT8 v = 0;
++	camera_intfer_get_senser_reg(reg, &v);
++	ADDLOG_INFO(LOG_FEATURE_CMD, "CamReg 0x%02x = 0x%02x", reg, v);
++	return CMD_RES_OK;
++}
++
++// CamDump - print the newest frame as hex lines over the console UART (for bring-up without Wi-Fi):
++//   CAMDUMP BEGIN <len>
++//   <64 hex chars per line>
++//   CAMDUMP END
++static commandResult_t Cam_Cmd_Dump(const void *context, const char *cmd, const char *args, int flags)
++{
++	UINT32 last = 0xFFFFFFFF;
++	int b = Cam_Acquire(&last, 3000);
++	if (b < 0) {
++		bk_printf("CAMDUMP NONE\r\n");
++		return CMD_RES_ERROR;
++	}
++	static const char hx[] = "0123456789abcdef";
++	char line[70];
++	UINT32 n = g_len[b];
++	bk_printf("CAMDUMP BEGIN %u\r\n", (unsigned)n);
++	for (UINT32 o = 0; o < n; o += 32) {
++		int k = 0;
++		for (UINT32 i = o; i < n && i < o + 32; i++) {
++			line[k++] = hx[g_buf[b][i] >> 4];
++			line[k++] = hx[g_buf[b][i] & 15];
++		}
++		line[k++] = '\r'; line[k++] = '\n'; line[k] = 0;
++		bk_printf("%s", line);
++		if ((o & 1023) == 0)
++			rtos_delay_milliseconds(1);
++	}
++	bk_printf("CAMDUMP END\r\n");
++	Cam_Release(b);
++	return CMD_RES_OK;
++}
++
++void BKCam_Init(void)
++{
++	HTTP_RegisterCallback("/snapshot.jpg", HTTP_GET, Cam_HttpSnapshot, 0);
++	HTTP_RegisterCallback("/stream", HTTP_GET, Cam_HttpStream, 0);
++	HTTP_RegisterCallback("/cam", HTTP_GET, Cam_HttpPage, 0);
++	//cmddetail:{"name":"CamStart","args":"","descr":"Start the DVP camera and JPEG encoder","fn":"Cam_Cmd_Start","file":"driver/drv_bkCam.c","requires":"","examples":""}
++	CMD_RegisterCommand("CamStart", Cam_Cmd_Start, NULL);
++	//cmddetail:{"name":"CamStop","args":"","descr":"Stop the camera","fn":"Cam_Cmd_Stop","file":"driver/drv_bkCam.c","requires":"","examples":""}
++	CMD_RegisterCommand("CamStop", Cam_Cmd_Stop, NULL);
++	//cmddetail:{"name":"CamInfo","args":"","descr":"Camera status and frame counters","fn":"Cam_Cmd_Info","file":"driver/drv_bkCam.c","requires":"","examples":""}
++	CMD_RegisterCommand("CamInfo", Cam_Cmd_Info, NULL);
++	//cmddetail:{"name":"CamReg","args":"reg [value]","descr":"Read or write a camera sensor register","fn":"Cam_Cmd_Reg","file":"driver/drv_bkCam.c","requires":"","examples":"CamReg 0x00"}
++	CMD_RegisterCommand("CamReg", Cam_Cmd_Reg, NULL);
++	//cmddetail:{"name":"CamDump","args":"","descr":"Print the newest JPEG frame as hex over the console UART","fn":"Cam_Cmd_Dump","file":"driver/drv_bkCam.c","requires":"","examples":""}
++	CMD_RegisterCommand("CamDump", Cam_Cmd_Dump, NULL);
++	Cam_Start();
++}
++
++void BKCam_StopDriver(void)
++{
++	Cam_Stop();
++}
++
++void BKCam_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState)
++{
++	if (bPreState)
++		return;
++	hprintf255(request, "<h5>Camera: %s, %u frames - <a href='/cam'>view</a></h5>",
++		g_running ? "running" : "stopped", g_frame_id);
++}
++
++#endif // ENABLE_DRIVER_BKCAM
+diff --git a/src/driver/drv_local.h b/src/driver/drv_local.h
+index 0c6e128..47a86a1 100644
+--- a/src/driver/drv_local.h
++++ b/src/driver/drv_local.h
+@@ -176,6 +176,9 @@ void SGP_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState
+ void SGP_OnEverySecond();
+ void SGP_StopDriver();
+ 
++void BKCam_Init(void);
++void BKCam_StopDriver(void);
++void BKCam_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState);
+ void BKCharge_Init(void);
+ void BKCharge_OnEverySecond(void);
+ void BKCharge_StopDriver(void);
+diff --git a/src/driver/drv_main.c b/src/driver/drv_main.c
+index 5932442..6465c0a 100644
+--- a/src/driver/drv_main.c
++++ b/src/driver/drv_main.c
+@@ -1476,6 +1476,22 @@ static driver_t g_drivers[] = {
+ 	false,                                   // loaded
+ 	},
+ #endif
++#if ENABLE_DRIVER_BKCAM
++	//drvdetail:{"name":"BKCam",
++	//drvdetail:"title":"TODO",
++	//drvdetail:"descr":"BK7252N DVP camera (tested with GC0329): JPEG snapshot at /snapshot.jpg, MJPEG stream at /stream, viewer at /cam. Commands CamStart, CamStop, CamInfo, CamReg, CamDump.",
++	//drvdetail:"requires":""}
++	{ "BKCam",                               // Driver Name
++	BKCam_Init,                              // Init
++	NULL,                                    // onEverySecond
++	BKCam_AppendInformationToHTTPIndexPage,  // appendInformationToHTTPIndexPage
++	NULL,                                    // runQuickTick
++	BKCam_StopDriver,                        // stopFunction
++	NULL,                                    // onChannelChanged
++	NULL,                                    // onHassDiscovery
++	false,                                   // loaded
++	},
++#endif
+ #if ENABLE_DRIVER_BKSDCARD
+ 	//drvdetail:{"name":"BKSDCard",
+ 	//drvdetail:"title":"TODO",
+diff --git a/src/obk_config.h b/src/obk_config.h
+index 9b41b1f..b992329 100644
+--- a/src/obk_config.h
++++ b/src/obk_config.h
+@@ -320,6 +320,7 @@
+ #define ENABLE_DRIVER_BATTERY					1
+ #if PLATFORM_BK7252N
+ #define ENABLE_DRIVER_BKCHARGE					1
++#define ENABLE_DRIVER_BKCAM						1
+ #define ENABLE_DRIVER_BKAUDIO					1
+ #define ENABLE_DRIVER_RTC						1
+ #endif
+-- 
+2.43.0
+

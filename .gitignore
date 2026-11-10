@@ -1,0 +1,14 @@
+# private: flash backups and logs contain Wi-Fi credentials and device keys
+backups/
+lab/
+captures/
+*.log
+# build output
+build-openbk/
+*.bin
+*.rbl
+# python
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

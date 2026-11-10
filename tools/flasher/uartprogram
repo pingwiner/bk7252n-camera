@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import textwrap
+from bkutils import UartDownloader
+
+segments = [
+    {"name": "bootloader", "startaddr": 0x00000000, "length": 0x10000},
+    {"name": "app", "startaddr": 0x11000, "length": 0x119000},
+]
+
+
+def find_segment(segment_name):
+    for segment in segments:
+        if segment['name'] == segment_name:
+            return segment['startaddr'], segment['length'], True
+    return None, None, False
+
+
+# parse commandline arguments
+def parse_args():
+    cmd = sys.argv[0]
+
+    description = '''Uart program utility.'''
+    parser = argparse.ArgumentParser(
+        description=description,
+        epilog=textwrap.dedent(f"""
+        Examples:
+          python {cmd} --port /dev/ttyUSB0 --startaddr 0x11000 app.bin
+          python {cmd} --segment app app.bin
+        """),
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    parser.add_argument('-p', '--port',
+                        default='/dev/ttyUSB0',
+                        help="UART port (e.g., COM3 or /dev/ttyUSB0)"
+                        )
+    parser.add_argument('-b', '--baudrate', type=int, default=921600, help="Baud rate (default: 921600)")
+
+    parser.add_argument('-s', '--startaddr',
+                        default=0x11000,
+                        type=lambda x: int(x, 0),
+                        help="Start address (default 0x11000)"
+                        )
+
+    parser.add_argument('--segment',
+                        type=str,
+                        choices=[segment['name'] for segment in segments],
+                        default=None,
+                        help="Segment name"
+                        )
+
+    parser.add_argument('input_file', type=str, help="Input file")
+
+
+    args = parser.parse_args()
+
+    if args.segment is not None:
+        # find segment by table
+        args.startaddr, _, found = find_segment(args.segment)
+        if not found:
+            parser.error("segment not found")
+            sys.exit(-1)
+
+    if args.startaddr & 0x0fff != 0:
+        parser.error("startaddr must align to 4k")
+        sys.exit(-1)
+
+    return args
+
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.port):
+        print(f"Device {args.port} doesn't exist")
+        sys.exit(-1)
+
+    filename = args.input_file
+
+    if not os.path.exists(filename):
+        print(f"File '{filename}' not found.", file=sys.stderr)
+        sys.exit(-1)
+
+    downloader = UartDownloader(args.port, args.baudrate, False)
+    success = downloader.programm(filename, args.startaddr)
+    if not success:
+        sys.exit(-1)
+
+
+if __name__ == "__main__":
+    main()
