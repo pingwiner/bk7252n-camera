@@ -21,6 +21,7 @@ Usage:
   uart_write_115200.py verify PORT START_ADDR IMAGE...    read-only: which image is on the flash
 """
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "flasher"))
@@ -43,6 +44,7 @@ class Serial115200(_OriginalSerial):
 serial.Serial = Serial115200       # boot_intf creates its port through serial.Serial
 
 import time                        # noqa: E402
+_T0 = time.time()
 import bkutils.boot_intf as bi     # noqa: E402
 from bkutils import UartDownloader  # noqa: E402
 from bkutils.flash_list import GetFlashInfo  # noqa: E402
@@ -76,6 +78,11 @@ bi.CBootIntf.WriteSector = write_sector
 # before the bootloader can serve flash commands (flash ID reads 0, status registers no reply).
 # Give it a moment after the first successful link check, and retry a zero flash ID.
 LINK_SETTLE = float(os.environ.get("LINK_SETTLE", "0"))
+MID_WAIT = float(os.environ.get("MID_WAIT", "0.03"))
+TRACE = os.environ.get("TRACE") == "1"
+T0 = _T0
+if TRACE:
+    print(f"T0 abs={T0:.3f}", flush=True)
 _link_check = bi.CBootIntf.LinkCheck
 
 
@@ -103,14 +110,32 @@ def link_check(self, *a, **k):
             self.Start_Cmd(b"\r\n" + RESET_CMD.encode() + b"\r\n")
     ok = _link_check(self, *a, **k)
     if ok and not getattr(self, "_settled", False):
+        # Keep the probes coming: the bootloader stays in download mode while link checks keep
+        # arriving, but its window right after power-up is short, and every pause (verifying an
+        # answer takes a few ms) risks missing it. While the camera is off, the half-powered chip
+        # answers almost every probe, so verify an answer at most every 250 ms and otherwise just
+        # keep probing. (The bench relay flow avoids the half-powered answers by arming.)
+        now = time.time()
+        if not LINK_ARM_FILE and now - getattr(self, "_verified_at", 0) < 0.25:
+            self.Drain()
+            return False
+        self._verified_at = now
         # A link-check "answer" can be noise on the unpowered camera's pins, or a Beken SDK app
         # (OpenBeken) that answers the link check but not flash commands. Accept the link only
         # once the flash ID reads back; otherwise keep probing at full speed - the bootloader's
         # window after power-up is short.
         if LINK_SETTLE:
             time.sleep(LINK_SETTLE)
-        self.Drain()
-        mid = _get_mid(self)
+        drain_quiet(self)
+        # Fast: the bootloader answers in ~1.5 ms; a long wait here (the vendor default is 50 ms)
+        # leaves a gap in the probing in which the real bootloader's short window after power-up
+        # passes unnoticed - while the camera is off, the half-powered chip answers almost every
+        # probe, so this check runs constantly.
+        t_mid = time.time()
+        mid, rx = query_mid(self, MID_WAIT)
+        if TRACE:
+            print(f"T {time.time() - T0:7.3f} mid=0x{mid:06X} rx={len(rx) if rx else 0} "
+                  f"in {1000 * (time.time() - t_mid):.0f} ms", flush=True)
         # Only a flash chip we know counts: the running firmware answers some probes too, and a
         # stray reply can look like a flash ID (seen: link accepted, then SetBR and every read
         # unanswered).
@@ -126,7 +151,10 @@ def link_check(self, *a, **k):
         # writer skips it when the speed does not change. It must be confirmed: while the camera
         # is switched off, the probes on our TX line half-power the chip through its RX pin, and
         # that "ghost" bootloader answers the link check and even the flash ID, but nothing after.
-        if not self.SetBR(LOCKED_BAUD, 20):
+        br = fast_setbr(self)
+        if TRACE:
+            print(f"T {time.time() - T0:7.3f} setbr={br}", flush=True)
+        if not br:
             self._ghosts = getattr(self, "_ghosts", 0) + 1
             if self._ghosts % 20 == 1:
                 print("bootloader answered but did not confirm the speed command - half-powered "
@@ -137,13 +165,66 @@ def link_check(self, *a, **k):
     return ok
 
 
+def parse_mid(buf):
+    """Find the flash-ID reply anywhere in buf (04 0e ff 01 e0 fc f4 len=5|6 00 cmd status id...).
+    The vendor parser only accepts it at the very start, so a leftover link-check reply in front
+    (the probes are fast, replies queue up) made a real bootloader look like "flash ID 0"."""
+    for ln in (5, 6):                  # 6: the BootROM length bug the vendor code also handles
+        hdr = bytes([0x04, 0x0E, 0xFF, 0x01, 0xE0, 0xFC, 0xF4, ln, 0x00, bi.CMD_FlashGetMID])
+        i = buf.find(hdr)
+        if i >= 0 and len(buf) >= i + 15:
+            return struct.unpack("<I", bytes(buf[i + 11:i + 15]))[0] >> 8
+    return None
+
+
+def query_mid(self, wait):
+    """Ask for the flash ID and read until its complete reply has arrived (or `wait` passes)."""
+    self.Start_Cmd(bi.BuildCmd_FlashGetMID(0x9f), 0)
+    buf = b""
+    t_end = time.time() + wait
+    while time.time() < t_end:
+        buf += self.ser.read(256)
+        mid = parse_mid(buf)
+        if mid is not None:
+            return mid, buf
+    return 0, buf
+
+
+def drain_quiet(self, quiet=0.005, limit=0.1):
+    """Read until the line has been quiet for `quiet` s: replies to earlier probes still in flight
+    would otherwise sit in front of the next reply."""
+    t_end = time.time() + limit
+    last = time.time()
+    while time.time() < t_end and time.time() - last < quiet:
+        if self.ser.read(256):
+            last = time.time()
+
+
+def fast_setbr(self, delay=20):
+    """SetBR at the same 115200, with a short wait and a reply search that tolerates leftover
+    replies in front. The bootloader confirms within ~15 ms; the vendor's 0.5 s wait per
+    unanswered try (the half-powered chip never answers) can hide the real bootloader's window."""
+    drain_quiet(self)
+    self.Start_Cmd(bi.BuildCmd_SetBaudRate(LOCKED_BAUD, delay), 0)
+    want = bytes([0x04, 0x0E, 3 + 1 + 4 + 1, 0x01, 0xE0, 0xFC, bi.CMD_SetBaudRate]) + \
+        struct.pack("<I", LOCKED_BAUD) + bytes([delay & 0xFF])
+    buf = b""
+    t_end = time.time() + 0.08
+    while time.time() < t_end:
+        buf += self.ser.read(256)
+        if want in buf:
+            return True
+    return False
+
+
 _get_mid = bi.CBootIntf.GetFlashMID
 
 
 def get_mid(self):
     mid = 0
     for _ in range(10):
-        mid = _get_mid(self)
+        drain_quiet(self)
+        mid, _ = query_mid(self, 0.1)
         if mid not in (0, 0xFFFFFF):
             break
         time.sleep(0.2)
@@ -243,23 +324,27 @@ def log(self, text):
 UartDownloader.log = log
 
 
+HAND_CYCLE_MSG = (f"Waiting up to {LINK_WAIT} s for the bootloader. Power-cycle the camera NOW: "
+                  "disconnect battery and USB, wait 2 s, reconnect the battery firmly in one go.")
+
+
 def connect(port):
     """Get the bootloader's attention the same way UartDownloader.programm does, at 115200."""
     dl = UartDownloader(port, LOCKED_BAUD, False)
     itf = dl.bootItf
     dl.do_reset_signal()
     itf.SendBkRegReboot()
-    print(f"Waiting up to {LINK_WAIT} s for the bootloader. Power-cycle the camera NOW: disconnect "
-          "battery and USB, wait 2 s, reconnect the battery firmly in one go.", flush=True)
+    print(HAND_CYCLE_MSG if not LINK_ARM_FILE else f"Waiting up to {LINK_WAIT} s for the bootloader.",
+          flush=True)
     timeout = Timeout(LINK_WAIT)
     count = 0
     while not itf.LinkCheck():
         if timeout.expired():
-            sys.exit(f"cannot get bus (power-cycle the camera right after starting) "
+            sys.exit(f"cannot get bus (power-cycle the camera while it waits) "
                      f"[commands {STATS['cmds']}, replies {STATS['replies']}, "
                      f"stalled writes {STATS['write_stalls']}]")
         count += 1
-        if count % 100 == 0:
+        if LINK_ARM_FILE and count % 100 == 0:
             itf.SendBkRegReboot()
             itf.Start_Cmd(b"\n")
             itf.Start_Cmd(b"reboot\n")
@@ -300,8 +385,11 @@ def write(port, start, path):
     size = os.path.getsize(path)
     if start + size > 0x200000:
         sys.exit("write would go past 0x200000")
-    print(f"Waiting up to {LINK_WAIT} s for the bootloader - take the battery out and back in now.")
+    if LINK_ARM_FILE:
+        print(f"Waiting up to {LINK_WAIT} s for the bootloader.")
     downloader = UartDownloader(port, LOCKED_BAUD, True)   # True: lift block protection first
+    if not LINK_ARM_FILE:
+        print(HAND_CYCLE_MSG, flush=True)
     if not downloader.programm(path, start):
         sys.exit("write failed")
     print("write verified (CRC match)")
@@ -342,8 +430,7 @@ def relink(itf):
     """Wait again for the bootloader on an open port (it was lost, e.g. a bouncing battery
     contact restarted the chip right after the first link)."""
     itf._settled = False
-    print(f"lost the bootloader - waiting up to {LINK_WAIT} s for it again "
-          "(power-cycle the camera if nothing happens)", flush=True)
+    print("lost the bootloader - power-cycle the camera once more", flush=True)
     timeout = Timeout(LINK_WAIT)
     while not itf.LinkCheck():
         if timeout.expired():

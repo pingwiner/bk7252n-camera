@@ -245,6 +245,45 @@ def job_flash_read(name, job):
                f"flash read 0x{start:x}+0x{length:x} (read-only)")
 
 
+def job_flash_read_manual(name, job):
+    """Read-only, imitating a hand power-cycle: the writer starts while the camera runs its
+    firmware (no arming), then the relay switches it off for off_s and on again."""
+    start, length = int(str(job["start"]), 0), int(str(job["length"]), 0)
+    off_s = float(job.get("off_s", 2))
+    path = RESULTS / f"{name}.log"
+    out = open(path, "w")
+    out.write(f"flash read (hand power-cycle imitation) 0x{start:x}+0x{length:x}\n")
+    out.write(relay("on") + "\n")
+    out.flush()
+    time.sleep(3)
+    env = dict(os.environ)
+    env.pop("LINK_ARM_FILE", None)
+    arm = LAB / f".arm_{name}"
+    arm.unlink(missing_ok=True)
+    if job.get("arm"):
+        env["LINK_ARM_FILE"] = str(arm)
+    env.update({k: str(v) for k, v in job.get("env", {}).items()})
+    proc = subprocess.Popen([PY, "-u", str(ROOT / "tools/uart_write_115200.py"), "read", CAM_PORT,
+                             hex(start), hex(length), str(RESULTS / f"{name}.flash")],
+                            cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, env=env)
+    time.sleep(float(job.get("before_s", 3)))
+    out.write(f"relay OFF abs={time.time():.3f} " + relay("off") + "\n")
+    out.flush()
+    time.sleep(off_s)
+    out.write(f"relay ON abs={time.time():.3f} " + relay("on") + "\n")
+    out.flush()
+    arm.touch()
+    try:
+        rc = proc.wait(timeout=900)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = "timeout"
+    out.write(f"\nwriter exit: {rc}\n")
+    out.close()
+    if rc != 0:
+        raise RuntimeError(f"writer exit {rc}")
+
+
 def job_flash_info(name, job):
     """Read-only: flash ID and status registers through the bootloader."""
     run_writer(name, ["info", CAM_PORT], "flash info (read-only)")
@@ -261,7 +300,7 @@ def job_ports(name, job):
 
 ACTIONS = {"ports": job_ports, "power": job_power, "cycle_capture": job_cycle_capture, "capture": job_capture,
            "send": job_send, "flash": job_flash, "flash_info": job_flash_info,
-           "flash_verify": job_flash_verify, "flash_read": job_flash_read}
+           "flash_verify": job_flash_verify, "flash_read": job_flash_read, "flash_read_manual": job_flash_read_manual}
 
 
 def main() -> None:
