@@ -19,7 +19,7 @@ cd ~/cam
 git clone https://github.com/openshwprojects/OpenBK7231T_App.git
 cd OpenBK7231T_App
 git checkout 168cba55                       # the OpenBeken version the patch was made against
-git submodule update --init sdk/beken_freertos_sdk
+git submodule update --init sdk/beken_freertos_sdk libraries/berry   # Beken SDK + Berry scripting
 (cd sdk/beken_freertos_sdk && git checkout f5a64d4)
 ```
 
@@ -30,7 +30,11 @@ git submodule update --init sdk/beken_freertos_sdk
 - **x86-64 Linux, or Docker on the Mac.** Beken's SDK ships its compiler, image packager and OTA
   packer as x86-64 Linux programs. They don't run natively on macOS, or on the Raspberry Pi (ARM).
 - On a Mac: [Docker Desktop](https://www.docker.com/products/docker-desktop/). On Apple silicon,
-  turn on **Settings → General → Use Rosetta for x86_64/amd64 emulation**.
+  turn on **Settings → General → Use Rosetta for x86_64/amd64 emulation**. Check it with
+  `docker run --rm --platform linux/amd64 ubuntu:22.04 uname -m` (prints `x86_64`). Colima works
+  too: `brew install colima docker`, `colima start --arch x86_64 --vm-type vz --vz-rosetta`.
+- The container runs as your user, so everything it writes in `OpenBK7231T_App` and
+  `build-openbk/` stays yours.
 - About 1.5 GB of free disk space. A build takes about a minute.
 
 ### Build on the Mac

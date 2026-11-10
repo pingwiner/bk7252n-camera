@@ -39,20 +39,31 @@ web-app URL, most flags) are hidden.
 
 ## Quick start
 
+You need **x86-64 Linux, or Docker** (Docker Desktop or Colima on a Mac; on Apple silicon with
+Rosetta for x86_64/amd64 emulation turned on): Beken's compiler and packaging tools are x86-64
+Linux programs. About 1.5 GB of disk.
+
 ```sh
-# sources (see docs/HOWTO.md for the exact versions)
+mkdir ~/cam && cd ~/cam
+git clone https://github.com/pingwiner/bk7252n-camera.git
+
+# OpenBeken at the version the patch was made against, with the two submodules the build needs
 git clone https://github.com/openshwprojects/OpenBK7231T_App.git
 git -C OpenBK7231T_App checkout 168cba55
-git -C OpenBK7231T_App submodule update --init sdk/beken_freertos_sdk
+git -C OpenBK7231T_App submodule update --init sdk/beken_freertos_sdk libraries/berry
 git -C OpenBK7231T_App/sdk/beken_freertos_sdk checkout f5a64d4
 
-# build (Mac with Docker; on x86-64 Linux run openbk-port/build_camera_fw.sh directly)
-cd bk7252n-camera/openbk-port && ./docker_build.sh 1.4.6
+# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.4.6)
+cd bk7252n-camera
+openbk-port/docker_build.sh 1.4.6        # -> build-openbk/OpenBK7252N_1.4.6_crc.bin and .rbl
 
 # flash over UART the first time (3.3 V adapter, camera on its battery), then OTA from the web page
 python3 -m venv .venv && .venv/bin/pip install -r tools/flasher/requirements.txt
 BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.6_crc.bin
 ```
+
+The build applies the patch to `OpenBK7231T_App` (it changes that checkout) and takes about a
+minute; the first Docker run also builds the container image.
 
 **Back up first.** Before the first flash, read the camera's whole 2 MiB flash through the
 bootloader (power-cycle the camera when it waits), always at 115200:

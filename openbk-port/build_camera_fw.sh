@@ -18,6 +18,7 @@ PATCH=$HERE/bk7252n-camera-openbk.patch
 SDK=$SRC/sdk/beken_freertos_sdk
 
 [ -d "$SDK/beken378" ] || { echo "no Beken SDK in $SDK (git submodule update --init sdk/beken_freertos_sdk)"; exit 1; }
+[ -f "$SRC/libraries/berry/tools/coc/coc" ] || { echo "no Berry sources in $SRC/libraries/berry (git submodule update --init libraries/berry)"; exit 1; }
 
 # 1. camera patch (skipped when already applied)
 if [ -f "$SRC/src/driver/drv_bkCam.c" ]; then
@@ -27,10 +28,23 @@ else
     patch -d "$SRC" -p1 --forward < "$PATCH"
 fi
 
-# 2. toolchain shipped with the SDK
-if [ ! -x "$SDK/toolchain/arm-none-eabi/bin/arm-none-eabi-gcc" ]; then
+# 2. toolchain shipped with the SDK. Unpacked into a temporary folder first and moved into place
+# only when complete (a marker file records that), so an interrupted unpack is redone. The
+# archive's owner and read-only folder modes are not restored: on a Docker bind mount from macOS
+# they make the folders unwritable halfway through the unpack.
+TC=$SDK/toolchain
+if [ ! -f "$TC/arm-none-eabi/.unpacked" ] || [ ! -x "$TC/arm-none-eabi/bin/arm-none-eabi-gcc" ]; then
     echo "== unpacking toolchain"
-    (cd "$SDK/toolchain" && tar xJf arm-none-eabi-gcc.tar.xz)
+    for d in "$TC/arm-none-eabi" "$TC/.unpack"; do
+        [ -e "$d" ] && chmod -R u+w "$d" && rm -rf "$d"
+    done
+    mkdir "$TC/.unpack"
+    tar -C "$TC/.unpack" --no-same-owner --no-same-permissions -xJf "$TC/arm-none-eabi-gcc.tar.xz"
+    [ -x "$TC/.unpack/arm-none-eabi/bin/arm-none-eabi-gcc" ] || { echo "toolchain archive did not unpack"; exit 1; }
+    chmod -R u+w "$TC/.unpack"         # the archive's folders are read-only (r-x)
+    mv "$TC/.unpack/arm-none-eabi" "$TC/arm-none-eabi"
+    rmdir "$TC/.unpack"
+    touch "$TC/arm-none-eabi/.unpacked"
 fi
 
 # 3. Berry scripting bindings (generated sources OpenBeken compiles in)

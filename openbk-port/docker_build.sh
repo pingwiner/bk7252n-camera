@@ -11,5 +11,7 @@ OBK=${OBK:-$(cd "$REPO/.." && pwd)/OpenBK7231T_App}
 [ -d "$OBK/sdk/beken_freertos_sdk" ] || { echo "OpenBeken sources not found in $OBK (set OBK=...)"; exit 1; }
 
 docker build --platform linux/amd64 -t bk7252n-cam-build "$HERE"
-docker run --rm --platform linux/amd64 -v "$REPO":/repo -v "$OBK":/obk bk7252n-cam-build \
+# Run as your own user: files in the shared folders stay yours, and nothing is created as root.
+docker run --rm --platform linux/amd64 -u "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v "$REPO":/repo -v "$OBK":/obk bk7252n-cam-build \
     sh /repo/openbk-port/build_camera_fw.sh /obk "$VER" /repo/build-openbk
