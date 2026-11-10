@@ -111,10 +111,14 @@ def link_check(self, *a, **k):
             time.sleep(LINK_SETTLE)
         self.Drain()
         mid = _get_mid(self)
-        if mid in (0, 0xFFFFFF):
+        # Only a flash chip we know counts: the running firmware answers some probes too, and a
+        # stray reply can look like a flash ID (seen: link accepted, then SetBR and every read
+        # unanswered).
+        if mid in (0, 0xFFFFFF) or GetFlashInfo(mid) is None:
             self._false_links = getattr(self, "_false_links", 0) + 1
             if self._false_links % 50 == 1:
-                print(f"link check answered but flash ID reads 0x{mid:06X} - not the bootloader, still probing")
+                print(f"link check answered but flash ID reads 0x{mid:06X} - not the bootloader "
+                      "(the camera's firmware is running), still probing")
             self.Drain()
             return False
         self._settled = True
@@ -238,7 +242,8 @@ def connect(port):
     itf = dl.bootItf
     dl.do_reset_signal()
     itf.SendBkRegReboot()
-    print(f"Waiting up to {LINK_WAIT} s for the bootloader - power-cycle the camera now if it does not connect.")
+    print(f"Waiting up to {LINK_WAIT} s for the bootloader. Power-cycle the camera NOW: disconnect "
+          "battery and USB, wait 2 s, reconnect the battery firmly in one go.", flush=True)
     timeout = Timeout(LINK_WAIT)
     count = 0
     while not itf.LinkCheck():
