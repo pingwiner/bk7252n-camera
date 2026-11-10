@@ -95,6 +95,7 @@ def open_cam() -> serial.Serial:
     s.dtr = False
     s.rts = False
     s.xonxoff = s.rtscts = s.dsrdtr = False
+    s.write_timeout = 2      # never block forever on a stalled USB-serial adapter
     s.port = CAM_PORT
     s.open()
     return s
@@ -235,6 +236,15 @@ def job_flash_verify(name, job):
     run_writer(name, ["verify", CAM_PORT, hex(APP_START)] + imgs, "flash verify (read-only)")
 
 
+def job_flash_read(name, job):
+    """Read-only: read a flash range through the bootloader into lab/results/<name>.bin."""
+    start, length = int(str(job["start"]), 0), int(str(job["length"]), 0)
+    if start < 0 or length <= 0 or start + length > 0x200000:
+        raise ValueError("range must lie inside the 2 MiB flash")
+    run_writer(name, ["read", CAM_PORT, hex(start), hex(length), str(RESULTS / f"{name}.flash")],
+               f"flash read 0x{start:x}+0x{length:x} (read-only)")
+
+
 def job_flash_info(name, job):
     """Read-only: flash ID and status registers through the bootloader."""
     run_writer(name, ["info", CAM_PORT], "flash info (read-only)")
@@ -251,7 +261,7 @@ def job_ports(name, job):
 
 ACTIONS = {"ports": job_ports, "power": job_power, "cycle_capture": job_cycle_capture, "capture": job_capture,
            "send": job_send, "flash": job_flash, "flash_info": job_flash_info,
-           "flash_verify": job_flash_verify}
+           "flash_verify": job_flash_verify, "flash_read": job_flash_read}
 
 
 def main() -> None:

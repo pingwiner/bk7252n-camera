@@ -48,6 +48,13 @@ confirm() {
 
 check_port() {
     [ -e "$PORT" ] || die "serial port $PORT not found (ls /dev/cu.*; set PORT=...)"
+    # A second program on the port (e.g. a flash run left hanging) swallows the bootloader's
+    # answers: every attempt then ends in "cannot get bus".
+    if command -v lsof >/dev/null; then
+        local users
+        users=$(lsof -t "$PORT" 2>/dev/null | tr '\n' ' ')
+        [ -z "$users" ] || die "$PORT is in use by process(es) $users- see: lsof $PORT; stop them with: kill $users"
+    fi
     "$PY" -c "import serial, tqdm" 2>/dev/null || die "$PY lacks pyserial/tqdm: $PY -m pip install -r tools/flasher/requirements.txt"
 }
 

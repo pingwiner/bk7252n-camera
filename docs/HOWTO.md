@@ -130,6 +130,10 @@ Rules learned the hard way:
 
 - **Only use 115200 baud.** The factory bootloader hangs when a tool switches it to 921600, and
   only a battery disconnect brings it back. The scripts refuse any other speed.
+- **"cannot get bus" every time, or "Resource busy":** another program still has the serial
+  port open (for example a flash run that was left hanging) and swallows the bootloader's
+  answers. `lsof /dev/cu.usbserial-…` shows it; stop it with `kill <PID>`. `camera_flash.sh`
+  checks this before it starts.
 - **"Unprotect Failed" or "cannot get bus":** power-cycle and run the command again. The script
   clears the flash write protection (including the SRP0 bit OpenBeken sets) before writing.
 - **"App verify failed! Need to recovery factory firmware."** at boot is only printed for images

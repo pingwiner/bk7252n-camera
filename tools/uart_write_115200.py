@@ -100,8 +100,7 @@ def link_check(self, *a, **k):
         if now - getattr(self, "_reset_at", 0) > 8:
             self._reset_at = now
             print(f"sending console reset {RESET_CMD!r}")
-            self.ser.write(b"\r\n" + RESET_CMD.encode() + b"\r\n")
-            self.ser.flush()
+            self.Start_Cmd(b"\r\n" + RESET_CMD.encode() + b"\r\n")
     ok = _link_check(self, *a, **k)
     if ok and not getattr(self, "_settled", False):
         # A link-check "answer" can be noise on the unpowered camera's pins, or a Beken SDK app
@@ -140,6 +139,40 @@ def get_mid(self):
     return mid
 
 
+# Serial writes get a time limit. Without one, pyserial blocks forever when the USB-serial driver
+# stops taking data (seen on macOS while the camera is switched off during link probing), and the
+# link-wait timeout is never reached. A stalled write counts as "no answer", so the normal retry
+# and timeout logic applies. 2 s is far above the 0.36 s a 4 KB sector takes at 115200.
+_bi_init = bi.CBootIntf.__init__
+_start_cmd = bi.CBootIntf.Start_Cmd
+
+
+def bi_init(self, *a, **k):
+    _bi_init(self, *a, **k)
+    self.ser.write_timeout = 2
+
+
+STATS = {"cmds": 0, "write_stalls": 0, "replies": 0}
+
+
+def start_cmd(self, *a, **k):
+    STATS["cmds"] += 1
+    try:
+        r = _start_cmd(self, *a, **k)
+        if r:
+            STATS["replies"] += 1
+        return r
+    except serial.SerialTimeoutException:
+        STATS["write_stalls"] += 1
+        try:
+            self.ser.reset_output_buffer()
+        except serial.SerialException:
+            pass
+        return None
+
+
+bi.CBootIntf.__init__ = bi_init
+bi.CBootIntf.Start_Cmd = start_cmd
 bi.CBootIntf.LinkCheck = link_check
 bi.CBootIntf.GetFlashMID = get_mid
 bi.CBootIntf.EraseBlock = erase_block
@@ -210,7 +243,9 @@ def connect(port):
     count = 0
     while not itf.LinkCheck():
         if timeout.expired():
-            sys.exit("cannot get bus (power-cycle the camera right after starting)")
+            sys.exit(f"cannot get bus (power-cycle the camera right after starting) "
+                     f"[commands {STATS['cmds']}, replies {STATS['replies']}, "
+                     f"stalled writes {STATS['write_stalls']}]")
         count += 1
         if count % 100 == 0:
             itf.SendBkRegReboot()
@@ -298,15 +333,25 @@ def read(port, start, length, out):
         sys.exit("start and length must be multiples of 4 KB")
     tmp = out + ".part"
     itf = connect(port)
+    print("bootloader connected, reading", flush=True)
     t0 = time.time()
     with open(tmp, "wb") as f:
         for n, addr in enumerate(range(start, start + length, 0x1000)):
             data = None
-            for _ in range(5):
-                a, b = itf.ReadSector(addr), itf.ReadSector(addr)
+            for attempt in range(5):
+                ts = time.time()
+                a = itf.ReadSector(addr)
+                b = itf.ReadSector(addr) if a else None
                 if a and b and bytes(a[:0x1000]) == bytes(b[:0x1000]):
                     data = bytes(a[:0x1000])
                     break
+                why = ("no answer" if not a else "no answer to the second read" if not b
+                       else "the two reads differ")
+                print(f"sector 0x{addr:06x}: {why} after {time.time() - ts:.1f} s "
+                      f"(attempt {attempt + 1}/5)", flush=True)
+                itf.Drain()
+            if n == 0 and data is not None:
+                print(f"first sector read in {time.time() - t0:.1f} s", flush=True)
             if data is None:
                 sys.exit(f"sector 0x{addr:06x}: no consistent read - nothing saved (partial file {tmp})")
             f.write(data)
