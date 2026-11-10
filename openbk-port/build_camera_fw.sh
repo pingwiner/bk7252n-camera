@@ -36,7 +36,12 @@ TC=$SDK/toolchain
 if [ ! -f "$TC/arm-none-eabi/.unpacked" ] || [ ! -x "$TC/arm-none-eabi/bin/arm-none-eabi-gcc" ]; then
     echo "== unpacking toolchain"
     for d in "$TC/arm-none-eabi" "$TC/.unpack"; do
-        [ -e "$d" ] && chmod -R u+w "$d" && rm -rf "$d"
+        if [ -e "$d" ]; then
+            chmod -R u+w "$d" 2>/dev/null || true
+            rm -rf "$d" 2>/dev/null || true
+            # e.g. left by an earlier build that ran as root
+            [ ! -e "$d" ] || { echo "cannot remove $d (owned by another user?); remove it with: sudo rm -rf <path>"; exit 1; }
+        fi
     done
     mkdir "$TC/.unpack"
     tar -C "$TC/.unpack" --no-same-owner --no-same-permissions -xJf "$TC/arm-none-eabi-gcc.tar.xz"
