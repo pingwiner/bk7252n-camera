@@ -5,6 +5,6 @@
 FROM ubuntu:22.04
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      make python3 patch xz-utils ca-certificates \
+      make python3 python-is-python3 patch xz-utils ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /cam
