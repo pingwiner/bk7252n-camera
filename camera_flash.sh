@@ -2,12 +2,14 @@
 # Flash / restore helper for the BK7252N camera, using the factory bootloader's UART protocol
 # (tools/flasher). The bootloader (physical 0x000000-0x010FFF) is never written.
 #
+#   ./camera_flash.sh backup           read the camera's whole flash into backups/ (read-only, ~6 min)
 #   ./camera_flash.sh prepare          build the factory restore image from the snapshot (no camera)
 #   ./camera_flash.sh verify [read]    read the camera's flash and compare with the snapshot (read-only);
 #                                      pass an earlier verify_*.bin to compare it without reading again
 #   ./camera_flash.sh info             read-only: flash chip ID and write-protection state
 #   ./camera_flash.sh restore          write the factory app + config back (0x11000-0x1FFFFF)
-#   ./camera_flash.sh flash <image>    write a CRC-wrapped app image at 0x11000
+#   ./camera_flash.sh flash <image>    write a CRC-wrapped app image at 0x11000 (makes a backup
+#                                      first if there is none)
 #
 # Environment: PORT (default /dev/cu.usbserial-120), BAUD (default and only allowed: 115200).
 #
@@ -75,6 +77,67 @@ print("sha256", hashlib.sha256(img).hexdigest())
 PYEOF
 }
 
+# Read the whole flash (read-only). A read of the factory firmware becomes $SNAPSHOT, from which
+# `prepare` builds the restore image; a read of a camera that already runs other firmware is kept as
+# backups/flash_<date>.bin (it still holds the camera's own MAC and keys at 0x1F0000+).
+backup() {
+    check_port
+    mkdir -p backups
+    local out
+    out="backups/flash_$(date +%Y%m%d_%H%M%S).bin"
+    say "Reading the camera's whole 2 MiB flash into $out (read-only, about 6 minutes)"
+    echo "When it waits for the bootloader, power-cycle the camera: disconnect the battery AND the"
+    echo "USB cable (USB alone keeps the board powered), then reconnect."
+    "$PY" tools/uart_write_115200.py read "$PORT" 0 0x200000 "$out"
+    local kind
+    kind=$("$PY" - "$out" <<'PYEOF'
+import re, sys
+d = open(sys.argv[1], "rb").read()
+# the app area is CRC-wrapped: 2 CRC bytes after every 32 data bytes. OpenBeken's app partition
+# ends at 0x132000; the factory app is larger (to ~0x1A3000), so look for it up to 0x1E0000.
+def plain(lo, hi):
+    return b"".join(d[i:i + 32] for i in range(lo, hi, 34))
+app = plain(0x11000, 0x132000)
+vendor = plain(0x11000, 0x1E0000)
+m = re.search(rb'"MAC_ADDR":"([0-9A-Fa-f]{12})"', d[0x1F0000:])
+mac = ":".join(m.group(1)[i:i + 2].decode() for i in range(0, 12, 2)) if m else "none found"
+if b"OpenBK" in app or b"OpenBeken" in app:
+    kind = "openbeken"
+elif b"xc_main" in vendor or b"RT-Thread" in vendor:
+    kind = "factory"
+else:
+    kind = "unknown"
+print(kind, mac)
+PYEOF
+)
+    echo "app area: ${kind% *} firmware, vendor MAC: ${kind#* }"
+    case "${kind% *}" in
+        factory)
+            if [ -f "$SNAPSHOT" ]; then
+                echo "kept as $out ($SNAPSHOT already exists)"
+            else
+                mv "$out" "$SNAPSHOT"
+                echo "saved as the factory backup $SNAPSHOT - keep it private, it holds credentials and keys"
+            fi ;;
+        *)
+            echo "NOTE: the camera does not run the factory firmware, so this is not a factory backup."
+            echo "It is kept as $out: it still holds the camera's own MAC and keys (0x1F0000+)." ;;
+    esac
+}
+
+ensure_backup() {
+    [ -f "$RESTORE_IMG" ] && return
+    if [ -f "$SNAPSHOT" ]; then prepare; return; fi
+    if ls backups/flash_*.bin >/dev/null 2>&1; then
+        echo "note: no factory backup; using the existing flash backup $(ls backups/flash_*.bin | tail -1)"
+        return
+    fi
+    confirm "There is no backup of this camera's flash yet. Read the whole flash now (read-only,
+about 6 minutes)? The write follows afterwards and needs a second power-cycle."
+    backup
+    if [ -f "$SNAPSHOT" ]; then prepare; fi
+}
+
 verify() {
     check_port
     [ -f "$RESTORE_IMG" ] || prepare
@@ -121,7 +184,10 @@ PYEOF
 
 restore() {
     check_port
-    [ -f "$RESTORE_IMG" ] || prepare
+    if [ ! -f "$RESTORE_IMG" ]; then
+        [ -f "$SNAPSHOT" ] || die "no factory backup ($SNAPSHOT); restore needs a backup made while the camera still ran its factory firmware"
+        prepare
+    fi
     confirm "This rewrites physical 0x11000-0x1FFFFF (factory app + config) on $PORT. Bootloader untouched."
     "$PY" tools/uart_write_115200.py write "$PORT" "$APP_START" "$RESTORE_IMG"
 }
@@ -130,21 +196,22 @@ flash() {
     local img="${1:-}"
     [ -n "$img" ] && [ -f "$img" ] || die "usage: $0 flash <image_crc.bin>"
     check_port
-    [ -f "$RESTORE_IMG" ] || prepare
+    ensure_backup
     local size; size=$(/usr/bin/stat -f %z "$img" 2>/dev/null || stat -c %s "$img")
     [ "$size" -le "$APP_LIMIT" ] || die "$img is $size bytes, larger than the app partition"
     case "$img" in *_crc.bin) ;; *) die "$img is not a CRC-wrapped image (*_crc.bin)";; esac
     shasum -a 256 "$img"
     confirm "This replaces the factory app on $PORT with $img ($size bytes at $APP_START).
-Way back: ./camera_flash.sh restore"
+Way back: ./camera_flash.sh restore (needs the factory backup)"
     "$PY" tools/uart_write_115200.py write "$PORT" "$APP_START" "$img"
 }
 
 case "${1:-}" in
+    backup)  backup ;;
     prepare) prepare ;;
     verify)  shift; verify "$@" ;;
     info)    check_port; "$PY" tools/uart_write_115200.py info "$PORT" ;;
     restore) restore ;;
     flash)   shift; flash "$@" ;;
-    *) sed -n '2,10p' "$0"; exit 1 ;;
+    *) sed -n '2,13p' "$0"; exit 1 ;;
 esac

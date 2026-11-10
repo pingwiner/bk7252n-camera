@@ -114,9 +114,15 @@ cd ~/cam/bk7252n-camera
 BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.6_crc.bin
 ```
 
+0. **First time only: backup.** If `backups/` has no backup of this camera yet, the script first
+   reads the whole flash (`./camera_flash.sh backup`, read-only, about 6 minutes; every sector
+   is read twice and must match). Power-cycle when it waits for the bootloader; the write then
+   needs a second power-cycle. A read of the factory firmware becomes `backups/factory_flash.bin`
+   (used by `restore`); a read of a camera that already runs other firmware is kept as
+   `backups/flash_<date>.bin`.
 1. Type `YES` to confirm.
-2. When it prints **"Waiting up to 30 s for the bootloader"**, disconnect the battery and
-   reconnect it. The bootloader only listens for the flasher for a moment after power-up.
+2. When it prints **"Waiting up to 30 s for the bootloader"**, disconnect the battery (and the
+   USB cable, if plugged in: it powers the board too) and reconnect. The bootloader only listens for the flasher for a moment after power-up.
 3. Erase, write and CRC verify take about 2.5 minutes. The script writes only from 0x11000 up: the
    bootloader (0x0–0x10FFF) is never written.
 

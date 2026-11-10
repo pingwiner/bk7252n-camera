@@ -17,6 +17,8 @@ Wraps tools/flasher (the vendor UartDownloader) with two fixes for the BK7252N c
 Usage:
   uart_write_115200.py info PORT                  read-only: flash ID and status registers
   uart_write_115200.py write PORT START_ADDR FILE
+  uart_write_115200.py read PORT START_ADDR LENGTH FILE   read-only: flash to a file (each sector read twice)
+  uart_write_115200.py verify PORT START_ADDR IMAGE...    read-only: which image is on the flash
 """
 import os
 import sys
@@ -289,12 +291,46 @@ def verify(port, start, paths):
         itf.SendReboot()
 
 
+def read(port, start, length, out):
+    """Read-only: read flash [start, start+length) through the bootloader into <out>. Every 4 KB
+    sector is read twice and must match (no checksum protects a sector read)."""
+    if start & 0xFFF or length & 0xFFF or length <= 0:
+        sys.exit("start and length must be multiples of 4 KB")
+    tmp = out + ".part"
+    itf = connect(port)
+    t0 = time.time()
+    with open(tmp, "wb") as f:
+        for n, addr in enumerate(range(start, start + length, 0x1000)):
+            data = None
+            for _ in range(5):
+                a, b = itf.ReadSector(addr), itf.ReadSector(addr)
+                if a and b and bytes(a[:0x1000]) == bytes(b[:0x1000]):
+                    data = bytes(a[:0x1000])
+                    break
+            if data is None:
+                sys.exit(f"sector 0x{addr:06x}: no consistent read - nothing saved (partial file {tmp})")
+            f.write(data)
+            done = n + 1
+            total = length // 0x1000
+            if done % 32 == 0 or done == total:
+                el = time.time() - t0
+                print(f"read 0x{addr + 0x1000:06x}  {done}/{total} sectors  "
+                      f"{el:.0f} s, about {el / done * (total - done):.0f} s left", flush=True)
+    os.replace(tmp, out)
+    print(f"saved {out} ({length} bytes)")
+    for _ in range(3):
+        time.sleep(0.01)
+        itf.SendReboot()
+
+
 def main():
     if len(sys.argv) >= 5 and sys.argv[1] == "verify":
         verify(sys.argv[2], int(sys.argv[3], 0), sys.argv[4:])
         return
     if len(sys.argv) == 3 and sys.argv[1] == "info":
         info(sys.argv[2])
+    elif len(sys.argv) == 6 and sys.argv[1] == "read":
+        read(sys.argv[2], int(sys.argv[3], 0), int(sys.argv[4], 0), sys.argv[5])
     elif len(sys.argv) == 5 and sys.argv[1] == "write":
         write(sys.argv[2], int(sys.argv[3], 0), sys.argv[4])
     else:

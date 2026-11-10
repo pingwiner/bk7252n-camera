@@ -65,17 +65,12 @@ BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.6_crc.bin
 The build applies the patch to `OpenBK7231T_App` (it changes that checkout) and takes about a
 minute; the first Docker run also builds the container image.
 
-**Back up first.** Before the first flash, read the camera's whole 2 MiB flash through the
-bootloader (power-cycle the camera when it waits), always at 115200:
-
-```sh
-.venv/bin/python3 tools/flasher/uartreader -p /dev/cu.usbserial-XXX -b 115200 -s 0 -l 0x200000 \
-    -o backups/factory_flash.bin
-```
-
-`camera_flash.sh prepare` turns it into the factory restore image (see the HOWTO).
-Never write one camera's backup to another: the factory config area (0x1F0000 and up) holds that
-camera's MAC and vendor keys.
+**Backup.** The first `camera_flash.sh flash` reads the camera's whole 2 MiB flash before it
+writes anything (read-only, about 6 minutes, then a second power-cycle for the write). A read of
+the factory firmware is saved as `backups/factory_flash.bin`, from which `camera_flash.sh restore`
+puts the original firmware back; `./camera_flash.sh backup` does the read on its own. Keep the
+backup private, and never write one camera's backup to another: the factory config area
+(0x1F0000 and up) holds that camera's MAC and vendor keys.
 
 ## Not in this repository
 
