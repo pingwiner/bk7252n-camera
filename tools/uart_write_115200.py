@@ -121,12 +121,19 @@ def link_check(self, *a, **k):
                       "(the camera's firmware is running), still probing")
             self.Drain()
             return False
-        self._settled = True
         # Without a command the bootloader leaves download mode within moments and starts the app
         # (flash ID then reads 0). SetBR at the same 115200 keeps it in download mode - the vendor
-        # writer skips it when the speed does not change.
+        # writer skips it when the speed does not change. It must be confirmed: while the camera
+        # is switched off, the probes on our TX line half-power the chip through its RX pin, and
+        # that "ghost" bootloader answers the link check and even the flash ID, but nothing after.
         if not self.SetBR(LOCKED_BAUD, 20):
-            print("SetBR after link check: no reply")
+            self._ghosts = getattr(self, "_ghosts", 0) + 1
+            if self._ghosts % 20 == 1:
+                print("bootloader answered but did not confirm the speed command - half-powered "
+                      "chip while the camera is off? Still probing: reconnect the battery.", flush=True)
+            self.Drain()
+            return False
+        self._settled = True
     return ok
 
 

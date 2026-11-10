@@ -20,12 +20,24 @@ SDK=$SRC/sdk/beken_freertos_sdk
 [ -d "$SDK/beken378" ] || { echo "no Beken SDK in $SDK (git submodule update --init sdk/beken_freertos_sdk)"; exit 1; }
 [ -f "$SRC/libraries/berry/tools/coc/coc" ] || { echo "no Berry sources in $SRC/libraries/berry (git submodule update --init libraries/berry)"; exit 1; }
 
-# 1. camera patch (skipped when already applied)
+# 1. camera patch. The checkout remembers which version of the patch it got (a hash in
+# .bk7252n-camera-patch); when the patch has changed since, the checkout must be reset first.
+PATCH_ID=$(cksum < "$PATCH" | cut -d' ' -f1)
+MARK=$SRC/.bk7252n-camera-patch
 if [ -f "$SRC/src/driver/drv_bkCam.c" ]; then
-    echo "== patch already applied"
+    if [ "$(cat "$MARK" 2>/dev/null)" = "$PATCH_ID" ]; then
+        echo "== patch already applied"
+    else
+        echo "== $SRC has an older version of the camera patch applied. Reset it, then build again:"
+        echo "   git -C $SRC reset -q --hard && git -C $SRC clean -qfd src platforms"
+        echo "   git -C $SRC/sdk/beken_freertos_sdk reset -q --hard"
+        echo "   git -C $SRC/sdk/beken_freertos_sdk clean -qfd beken378"
+        exit 1
+    fi
 else
     echo "== applying $(basename "$PATCH")"
     patch -d "$SRC" -p1 --forward < "$PATCH"
+    echo "$PATCH_ID" > "$MARK"
 fi
 
 # 2. toolchain shipped with the SDK. Unpacked into a temporary folder first and moved into place
