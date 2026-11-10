@@ -41,17 +41,17 @@ git submodule update --init sdk/beken_freertos_sdk libraries/berry   # Beken SDK
 
 ```sh
 cd ~/cam/bk7252n-camera/openbk-port
-./docker_build.sh 1.4.6          # pick a new version number each time
+./docker_build.sh 1.4.7          # pick a new version number each time
 ```
 
 The first run also builds the Docker image, which takes a few minutes. The results are:
 
 ```
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.6_crc.bin   UART image (0x121000 bytes), flash at 0x11000
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.6.rbl       OTA package (~500 KB)
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.7_crc.bin   UART image (0x121000 bytes), flash at 0x11000
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.7.rbl       OTA package (~500 KB)
 ```
 
-The version also appears on the camera's main page and `/cam` page as "fw 1.4.6", so you can see
+The version also appears on the camera's main page and `/cam` page as "fw 1.4.7", so you can see
 which build is running.
 
 ### Build on x86-64 Linux
@@ -59,7 +59,7 @@ which build is running.
 You need `make`, `python3`, `patch` and `xz`. Then:
 
 ```sh
-sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.4.6
+sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.4.7
 ```
 
 ### What the build script does
@@ -111,7 +111,7 @@ If an update doesn't come back up, flash the matching `*_crc.bin` over UART (sec
 
 ```sh
 cd ~/cam/bk7252n-camera
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.6_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.7_crc.bin
 ```
 
 0. **First time only: backup.** If `backups/` has no backup of this camera yet, the script first
@@ -146,9 +146,9 @@ With the Arduino relay on `/dev/cu.usbserial-140` and the agent running
 typing commands. Drop JSON files into `lab/jobs/`, for example:
 
 ```json
-{"action": "flash", "image": "build-openbk/OpenBK7252N_1.4.6_crc.bin"}
+{"action": "flash", "image": "build-openbk/OpenBK7252N_1.4.7_crc.bin"}
 {"action": "cycle_capture", "seconds": 30, "off_s": 3}
-{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.4.6_crc.bin"]}
+{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.4.7_crc.bin"]}
 ```
 
 Results appear in `lab/results/`. The agent power-cycles the camera into the bootloader itself and

@@ -53,13 +53,13 @@ git -C OpenBK7231T_App checkout 168cba55
 git -C OpenBK7231T_App submodule update --init sdk/beken_freertos_sdk libraries/berry
 git -C OpenBK7231T_App/sdk/beken_freertos_sdk checkout f5a64d4
 
-# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.4.6)
+# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.4.7)
 cd bk7252n-camera
-openbk-port/docker_build.sh 1.4.6        # -> build-openbk/OpenBK7252N_1.4.6_crc.bin and .rbl
+openbk-port/docker_build.sh 1.4.7        # -> build-openbk/OpenBK7252N_1.4.7_crc.bin and .rbl
 
 # flash over UART the first time (3.3 V adapter, camera on its battery), then OTA from the web page
 python3 -m venv .venv && .venv/bin/pip install -r tools/flasher/requirements.txt
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.6_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.7_crc.bin
 ```
 
 The build applies the patch to `OpenBK7231T_App` (it changes that checkout) and takes about a

@@ -299,6 +299,69 @@ diff -ruN pa3/sdk/beken_freertos_sdk/build/bk7252n_bsp.lds pb3/sdk/beken_freerto
          *(.text.intc_irq)
          *(.text.intc_fiq)
          *(.text.bk_timer_isr)
+diff -ruN pa3/src/cmnds/cmd_main.c pb3/src/cmnds/cmd_main.c
+--- a/src/cmnds/cmd_main.c	2026-11-11 01:35:18.549895756 +0400
++++ b/src/cmnds/cmd_main.c	2026-11-11 01:35:18.551661145 +0400
+@@ -767,8 +767,10 @@
+ }
+ void CMD_UARTConsole_Run() {
+ #if PLATFORM_BEKEN || PLATFORM_ARMINO
++	// Run a command only when its line is complete (CR or LF). A terminal that sends each key as
++	// it is typed (screen, minicom) would otherwise have half-typed words run as commands.
+ 	char a;
+-	int i;
++	int i, n, end;
+ 	int totalSize;
+ 	char tmp[128];
+ 
+@@ -783,22 +785,38 @@
+ 			break;
+ 		}
+ 	}
+-	if (totalSize < 2) {
++	if (totalSize < 1) {
+ 		return;
+ 	}
+-	// skip garbage data (should not happen)
++	end = -1;
+ 	for (i = 0; i < totalSize; i++) {
+ 		a = UART_GetByte(i);
+-		if (i + 1 < sizeof(tmp)) {
+-			tmp[i] = a;
+-			tmp[i + 1] = 0;
+-		}
+-		if (a == '\n') {
++		if (a == '\n' || a == '\r') {
++			end = i;
+ 			break;
+ 		}
+ 	}
+-	UART_ConsumeBytes(i);
+-	CMD_ExecuteCommand(tmp, 0);
++	if (end < 0) {
++		if (totalSize >= (int)sizeof(tmp) - 1) {
++			UART_ConsumeBytes(totalSize);	// an over-long line without Enter: drop it
++		}
++		return;	// wait for Enter
++	}
++	n = 0;
++	for (i = 0; i < end; i++) {
++		a = UART_GetByte(i);
++		if (a == 8 || a == 127) {	// backspace / delete
++			if (n > 0)
++				n--;
++		}
++		else if ((unsigned char)a >= 32 && n < (int)sizeof(tmp) - 1) {
++			tmp[n++] = a;
++		}
++	}
++	tmp[n] = 0;
++	UART_ConsumeBytes(end + 1);
++	if (n > 0)
++		CMD_ExecuteCommand(tmp, 0);
+ #endif
+ }
+ void CMD_RunUartCmndIfRequired() {
 diff -ruN pa3/src/cmnds/cmd_tcp.c pb3/src/cmnds/cmd_tcp.c
 --- a/src/cmnds/cmd_tcp.c	2026-11-10 15:39:38.111998683 +0400
 +++ b/src/cmnds/cmd_tcp.c	2026-11-10 15:39:38.113681484 +0400
