@@ -326,19 +326,38 @@ def verify(port, start, paths):
         itf.SendReboot()
 
 
+def relink(itf):
+    """Wait again for the bootloader on an open port (it was lost, e.g. a bouncing battery
+    contact restarted the chip right after the first link)."""
+    itf._settled = False
+    print(f"lost the bootloader - waiting up to {LINK_WAIT} s for it again "
+          "(power-cycle the camera if nothing happens)", flush=True)
+    timeout = Timeout(LINK_WAIT)
+    while not itf.LinkCheck():
+        if timeout.expired():
+            sys.exit("cannot get bus again - run the command again and power-cycle the camera "
+                     "with one firm reconnect of the battery")
+    time.sleep(0.01)
+    itf.Drain()
+    print("bootloader connected again, continuing", flush=True)
+
+
 def read(port, start, length, out):
     """Read-only: read flash [start, start+length) through the bootloader into <out>. Every 4 KB
-    sector is read twice and must match (no checksum protects a sector read)."""
+    sector is read twice and must match (no checksum protects a sector read). If the bootloader
+    stops answering, wait for it again and continue from the same sector."""
     if start & 0xFFF or length & 0xFFF or length <= 0:
         sys.exit("start and length must be multiples of 4 KB")
     tmp = out + ".part"
     itf = connect(port)
     print("bootloader connected, reading", flush=True)
     t0 = time.time()
+    relinks = 0
+    total = length // 0x1000
     with open(tmp, "wb") as f:
         for n, addr in enumerate(range(start, start + length, 0x1000)):
             data = None
-            for attempt in range(5):
+            for attempt in range(6):
                 ts = time.time()
                 a = itf.ReadSector(addr)
                 b = itf.ReadSector(addr) if a else None
@@ -348,15 +367,19 @@ def read(port, start, length, out):
                 why = ("no answer" if not a else "no answer to the second read" if not b
                        else "the two reads differ")
                 print(f"sector 0x{addr:06x}: {why} after {time.time() - ts:.1f} s "
-                      f"(attempt {attempt + 1}/5)", flush=True)
+                      f"(attempt {attempt + 1}/6)", flush=True)
                 itf.Drain()
-            if n == 0 and data is not None:
-                print(f"first sector read in {time.time() - t0:.1f} s", flush=True)
+                if not a and attempt % 2 == 1:     # two silent attempts: the bootloader is gone
+                    relinks += 1
+                    if relinks > 5:
+                        sys.exit("the bootloader keeps disappearing - check the battery and wiring")
+                    relink(itf)
             if data is None:
                 sys.exit(f"sector 0x{addr:06x}: no consistent read - nothing saved (partial file {tmp})")
+            if n == 0:
+                print(f"first sector read in {time.time() - t0:.1f} s", flush=True)
             f.write(data)
             done = n + 1
-            total = length // 0x1000
             if done % 32 == 0 or done == total:
                 el = time.time() - t0
                 print(f"read 0x{addr + 0x1000:06x}  {done}/{total} sectors  "
