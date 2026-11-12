@@ -41,17 +41,17 @@ git submodule update --init sdk/beken_freertos_sdk libraries/berry   # Beken SDK
 
 ```sh
 cd ~/cam/bk7252n-camera/openbk-port
-./docker_build.sh 1.4.9          # pick a new version number each time
+./docker_build.sh 1.5.0          # pick a new version number each time
 ```
 
 The first run also builds the Docker image, which takes a few minutes. The results are:
 
 ```
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.9_crc.bin   UART image (0x121000 bytes), flash at 0x11000
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.9.rbl       OTA package (~500 KB)
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.0_crc.bin   UART image (0x121000 bytes), flash at 0x11000
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.0.rbl       OTA package (~500 KB)
 ```
 
-The version also appears on the camera's main page and `/cam` page as "fw 1.4.9", so you can see
+The version also appears on the camera's main page and `/cam` page as "fw 1.5.0", so you can see
 which build is running.
 
 ### Build on x86-64 Linux
@@ -59,7 +59,7 @@ which build is running.
 You need `make`, `python3`, `patch` and `xz`. Then:
 
 ```sh
-sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.4.9
+sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.5.0
 ```
 
 ### What the build script does
@@ -126,7 +126,7 @@ the card or `SdUpdate install` is run.
 | `SdUpdate force` | install the newest package even if it is not newer (downgrade) |
 
 The card is read in 1-bit SD mode on GPIO14–19 (the SoC's SD host); FatFs R0.16 by ChaN,
-read-only, is built in for this (`openbk-port/fatfs/`).
+is built in for this and for the motion pictures (`openbk-port/fatfs/`).
 
 ## 3. Flash over UART (first install or recovery)
 
@@ -142,7 +142,7 @@ read-only, is built in for this (`openbk-port/fatfs/`).
 
 ```sh
 cd ~/cam/bk7252n-camera
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.9_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.0_crc.bin
 ```
 
 0. **First time only: backup.** If `backups/` has no backup of this camera yet, the script first
@@ -177,9 +177,9 @@ With the Arduino relay on `/dev/cu.usbserial-140` and the agent running
 typing commands. Drop JSON files into `lab/jobs/`, for example:
 
 ```json
-{"action": "flash", "image": "build-openbk/OpenBK7252N_1.4.9_crc.bin"}
+{"action": "flash", "image": "build-openbk/OpenBK7252N_1.5.0_crc.bin"}
 {"action": "cycle_capture", "seconds": 30, "off_s": 3}
-{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.4.9_crc.bin"]}
+{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.5.0_crc.bin"]}
 ```
 
 Results appear in `lab/results/`. The agent power-cycles the camera into the bootloader itself and
@@ -272,6 +272,8 @@ command line:
 | `CamBattery cal <mV>` | calibrate against a multimeter reading taken right now |
 | `CamBattery cutoff <mV>` | low-battery deep-sleep threshold (default 3450, `0` = off) |
 | `SdUpdate [install\|force]` | firmware update from the microSD card (section 2) |
+| `CamRec [on\|off\|seconds]` | motion pictures on the SD card |
+| `CamTimezone [+hh:mm]` | time zone for picture names |
 | `GpioWatch <seconds> [probe]` | log GPIO input changes (how the buttons were found) |
 
 ### Microphone
@@ -302,6 +304,32 @@ appear in the log, on the main page, and as the MQTT topic `<client>/motion` (1/
 
 `/cam` has two sliders, **Motion diff** and **Motion area**. Changes are stored in retained
 channels 8 and 9; `CamMotion <sensitivity> <area>` and `/cammotion?pix=25&area=20` do the same.
+
+### Motion pictures on the SD card
+
+With a microSD card (FAT32 or exFAT) in the camera, every motion event is saved as JPEG
+pictures: the first frame as soon as motion is detected, then one every 2 s while it lasts.
+
+- Files: `MOTION/<yyyy-mm-dd>/<hh-mm-ss>.jpg` in local time. The camera starts NTP by itself
+  (OpenBeken's NTP server setting); the time zone is taken from the browser whenever `/cam` is
+  opened, or set with `CamTimezone +4` (or `+5:30`, `-3`), and kept (retained channel 4). Until the
+  clock has synced after a start, pictures go to `MOTION/B<boot number>/U<seconds since start>.jpg`.
+- `http://<camera>/motion` lists the days; a day shows the newest 120 pictures as thumbnails, each
+  linking to the full picture (`/sd/<path>` serves any file on the card). These pages use the
+  web password if one is set.
+- When less than 16 MB or 5 % of the card is free, the oldest day's pictures are deleted.
+- MQTT: `<client>/motion_file` = path of each saved picture.
+- The main page and `/cam` show the card's free space and pictures saved since the start.
+
+| Command | |
+|---|---|
+| `CamRec` | status: card, free space, saved / failed / deleted pictures, clock |
+| `CamRec off` / `CamRec on` | stop / start saving pictures (kept in retained channel 3) |
+| `CamRec <seconds>` | one picture every `<seconds>` while motion lasts; `0` = only the first picture of each event |
+| `CamTimezone [+hh:mm]` | show or set the time zone used for the picture names |
+
+The card stays mounted while the camera runs. If it is pulled out, writes fail and the camera
+tries to mount it again every 30 s.
 
 ### Battery
 

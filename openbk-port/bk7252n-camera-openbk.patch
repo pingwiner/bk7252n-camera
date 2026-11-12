@@ -566,8 +566,8 @@ diff -ruN pa3/src/driver/drv_audio.c pb3/src/driver/drv_audio.c
  	//cmddetail:"fn":"CMD_BKAudioOpen","file":"driver/drv_audio.c","requires":"",
 diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 --- a/src/driver/drv_bkCam.c	1970-01-01 04:00:00.000000000 +0400
-+++ b/src/driver/drv_bkCam.c	2026-11-12 23:01:13.610860402 +0400
-@@ -0,0 +1,1318 @@
++++ b/src/driver/drv_bkCam.c	2026-11-13 00:06:47.006988813 +0400
+@@ -0,0 +1,1373 @@
 +// BK7252N DVP camera (GC0329 on the security-camera board): JPEG frames from the on-chip encoder,
 +// served as /snapshot.jpg, an MJPEG /stream and a /cam page.
 +//
@@ -852,7 +852,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		"<label><span>Motion diff</span><input id='mp' type='range' min='3' max='128' step='1'><b id='mpv'></b></label>"
 +		"<label><span>Motion area</span><input id='ma' type='range' min='1' max='200' step='1'><b id='mav'></b></label>"
 +		"<div id='mbar'><div id='mlv'></div><div id='mth'></div></div><div id='mst'>&nbsp;</div>"
-+		"<p><span id='bat'></span><a href='/snapshot.jpg'>snapshot</a> &middot; <a href='/index'>device</a> &middot; " CAM_FW_TAG "</p></div>");
++		"<p><span id='bat'></span><span id='sd'></span><a href='/motion'>motion pictures</a> &middot; <a href='/snapshot.jpg'>snapshot</a> &middot; <a href='/index'>device</a> &middot; " CAM_FW_TAG "</p></div>");
 +	poststr(request, "<script>"
 +		"var g=document.getElementById('g'),t=document.getElementById('t'),busy=0;"
 +		"function scale(v){return Math.max(600,4*v)}"
@@ -875,10 +875,11 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		"document.getElementById('mst').textContent='changed '+(d.changed/10).toFixed(1)+'%  -  '+(d.motion?'MOTION DETECTED':'no motion')+'  -  '+d.events+' events';}}"
 +		"function mpoll(set){if(mbusy&&!set)return;mbusy=1;fetch('/cammotion'+(set||'')).then(function(r){return r.json()}).then(function(d){"
 +		"mshow(d);mbusy=0}).catch(function(){mbusy=0})}"
-+		"var sbusy=0,first=1;function spoll(){if(sbusy)return;sbusy=1;fetch('/camstatus').then(function(r){return r.json()}).then(function(d){"
++		"var sbusy=0,first=1;function spoll(){if(sbusy)return;sbusy=1;fetch('/camstatus'+(first?'?tz='+(-new Date().getTimezoneOffset()):'')).then(function(r){return r.json()}).then(function(d){"
 +		"if(first||document.activeElement!==g)g.value=d.a.gain;if(first||document.activeElement!==t)t.value=d.a.thr;"
 +		"if(first||document.activeElement!==mp)mp.value=d.m.pix;if(first||document.activeElement!==ma)ma.value=d.m.area;first=0;"
-+		"show(d.a);mshow(d.m);if(d.b&&d.b.mv>=0)document.getElementById('bat').textContent='battery '+(d.b.mv/1000).toFixed(2)+' V, '+d.b.pct+'% \u00b7 ';sbusy=0}).catch(function(){sbusy=0})}"
++		"show(d.a);mshow(d.m);if(d.b&&d.b.mv>=0)document.getElementById('bat').textContent='battery '+(d.b.mv/1000).toFixed(2)+' V, '+d.b.pct+'% \u00b7 ';"
++		"if(d.sd)document.getElementById('sd').textContent=d.sd.card?'SD '+d.sd.free+' MB free, '+(d.sd.rec<0?'pictures off':d.sd.saved+' saved')+' \u00b7 ':'no SD card \u00b7 ';sbusy=0}).catch(function(){sbusy=0})}"
 +		"mp.oninput=ma.oninput=function(){mshow()};"
 +		"mp.onchange=ma.onchange=function(){mpoll('?pix='+mp.value+'&area='+ma.value)};"
 +		"spoll();setInterval(spoll,1000);"
@@ -1420,6 +1421,49 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	}
 +}
 +
++// ---- motion pictures on the SD card (drv_bkCamSd.c does the file side)
++int BKCamSd_RecInterval(void);
++int BKCamSd_SaveJpeg(const UINT8 *data, UINT32 len, char *out, int outLen);
++void BKCamSd_Housekeeping(void);
++void BKCamSd_Start(void);
++void BKCamSd_SetTimezone(int minutes, int save);
++void BKCamSd_AppendStatus(http_request_t *request);
++void BKCamSd_AppendIndex(http_request_t *request);
++
++// First picture as soon as motion is detected, then one every BKCamSd_RecInterval() seconds while
++// it lasts. The frame buffer is written straight to the card (no copy) and released afterwards.
++static void Rec_Task(beken_thread_arg_t arg)
++{
++	UINT32 last = 0xFFFFFFFF, next = 0;
++	int was = 0;
++	char name[48];
++	for (;;) {
++		rtos_delay_milliseconds(100);
++		int iv = BKCamSd_RecInterval(), act = g_motActive;
++		if (!act || iv < 0 || !g_running) {
++			was = act;
++			continue;
++		}
++		UINT32 now = rtos_get_time();
++		if (was && (iv == 0 || (int)(now - next) < 0))
++			continue;
++		was = 1;
++		next = now + (iv > 0 ? iv : 1) * 1000;
++		int b = Cam_Acquire(&last, 1000);
++		if (b < 0)
++			continue;
++		int r = BKCamSd_SaveJpeg(g_buf[b], g_len[b], name, sizeof(name));
++		Cam_Release(b);
++		if (r == 0) {
++			ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam: saved %s", name);
++#if ENABLE_MQTT
++			MQTT_PublishMain_StringString("motion_file", name, 0);
++#endif
++			BKCamSd_Housekeeping();
++		}
++	}
++}
++
 +static void Mot_Set(int pix, int area)
 +{
 +	if (pix >= 3 && pix <= 128 && pix != g_motPix) {
@@ -1675,7 +1719,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	if (!h.names)
 +		return CMD_RES_ERROR;
 +	if (!h.filter)
-+		ADDLOG_INFO(LOG_FEATURE_CMD, "Camera: CamInfo CamStart CamStop CamReg CamDump CamAudio CamMotion CamBattery SdUpdate PowerOff GpioWatch");
++		ADDLOG_INFO(LOG_FEATURE_CMD, "Camera: CamInfo CamStart CamStop CamReg CamDump CamAudio CamMotion CamBattery CamRec CamTimezone SdUpdate PowerOff GpioWatch");
 +	CMD_ListAllCommands(&h, Help_Add);
 +	qsort(h.names, h.count, sizeof(char *), Help_Cmp);
 +	for (i = 0; i < h.count; i++) {
@@ -1738,13 +1782,18 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +// /camstatus - audio and motion state in one JSON object (the /cam page polls this once a second)
 +static int Cam_HttpStatus(http_request_t *request)
 +{
++	char tz[8];
++	if (http_getArg(request->url, "tz", tz, sizeof(tz)))     // the /cam page sends the browser's time zone
++		BKCamSd_SetTimezone(atoi(tz), 1);
 +	http_setup(request, "application/json");
 +	hprintf255(request, "{\"a\":{\"gain\":%i,\"thr\":%i,\"rms\":%i,\"peak\":%i,\"sound\":%i,\"events\":%u,\"mic\":%i},",
 +		g_audGain, g_sndThresh, g_sndRms, g_sndPeak, g_sndActive, g_sndEvents, g_audH != DD_HANDLE_UNVALID);
 +	hprintf255(request, "\"m\":{\"pix\":%i,\"area\":%i,\"changed\":%i,\"motion\":%i,\"events\":%u},",
 +		g_motPix, g_motArea, g_motChanged, g_motActive, g_motEvents);
-+	hprintf255(request, "\"b\":{\"mv\":%i,\"pct\":%i,\"raw\":%i,\"cutoff\":%i}}",
++	hprintf255(request, "\"b\":{\"mv\":%i,\"pct\":%i,\"raw\":%i,\"cutoff\":%i}",
 +		g_batMv, g_batPct, g_batRaw, Bat_CutoffActive() ? g_batCutoff : 0);
++	BKCamSd_AppendStatus(request);
++	poststr(request, "}");
 +	poststr(request, NULL);
 +	return 0;
 +}
@@ -1850,6 +1899,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	} else {
 +		ADDLOG_INFO(LOG_FEATURE_CMD, "SD update: skipped, battery %d mV is too low", g_batMv);
 +	}
++	BKCamSd_Start();
 +	// Discovery, so the camera can be found without the router's client list: mDNS answers
 +	// <short name>.local and announces an _http._tcp service (macOS/iOS/Windows/Linux, Android
 +	// service browsers); SSDP lists it under Network in Windows Explorer. Both wait for Wi-Fi.
@@ -1857,12 +1907,16 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +#if ENABLE_DRIVER_MDNS
 +	ScheduleDriverStart("MDNS", 2);
 +#endif
++#if ENABLE_NTP
++	ScheduleDriverStart("NTP", 3);          // clock for the picture names on the SD card
++#endif
 +#if ENABLE_DRIVER_SSDP && BKCAM_START_SSDP
 +	ScheduleDriverStart("SSDP", 2);
 +#endif
 +	Cam_Start();
 +	Aud_Start();
 +	Mot_Start();
++	rtos_create_thread(NULL, BEKEN_APPLICATION_PRIORITY, "camrec", Rec_Task, 2048, NULL);
 +}
 +
 +void BKCam_StopDriver(void)
@@ -1881,6 +1935,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +			Bat_CutoffActive() ? "" : " (cut-off inactive)");
 +	hprintf255(request, "<h5>Motion: %s, %i.%i %% changed (trigger %i.%i %%), %u events</h5>",
 +		g_motActive ? "DETECTED" : "none", g_motChanged / 10, g_motChanged % 10, g_motArea / 10, g_motArea % 10, g_motEvents);
++	BKCamSd_AppendIndex(request);
 +	hprintf255(request, "<h5>Microphone: %s, level %i (threshold %i), sound %s, %u events - <a href='/audio.wav'>listen</a></h5>",
 +		g_audH != DD_HANDLE_UNVALID ? "on" : "off", g_sndRms, g_sndThresh, g_sndActive ? "DETECTED" : "quiet", g_sndEvents);
 +}
@@ -1888,8 +1943,8 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +#endif // ENABLE_DRIVER_BKCAM
 diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 --- a/src/driver/drv_bkCamSd.c	1970-01-01 04:00:00.000000000 +0400
-+++ b/src/driver/drv_bkCamSd.c	2026-11-12 23:01:13.609800577 +0400
-@@ -0,0 +1,378 @@
++++ b/src/driver/drv_bkCamSd.c	2026-11-13 00:06:47.005393804 +0400
+@@ -0,0 +1,829 @@
 +// BK7252N camera: firmware update from the microSD card.
 +//
 +// At boot (and with the SdUpdate command) the camera looks in the root folder of a FAT32 or exFAT
@@ -1910,6 +1965,9 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +#include "../logging/logging.h"
 +#include "../hal/hal_generic.h"
 +#include "../hal/hal_flashVars.h"
++#include "../httpserver/new_http.h"
++#include "lwip/sockets.h"
++#include <stdlib.h>
 +#include "include.h"
 +#include "rtos_pub.h"
 +#include "mem_pub.h"
@@ -1918,6 +1976,8 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +#if __has_include("drv_bkCam_version.h")
 +#include "drv_bkCam_version.h"
 +#endif
++#include "drv_deviceclock.h"
++#include <time.h>
 +
 +#ifndef CAM_FW_TAG
 +#define CAM_FW_TAG "fw dev"
@@ -1928,6 +1988,8 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +extern int bk_sd_card_init(void);
 +extern int bk_sd_card_deinit(void);
 +extern int bk_sd_card_read_blocks(uint8_t *data, uint32_t block_addr, uint32_t block_num);
++extern int bk_sd_card_write_blocks(const uint8_t *data, uint32_t block_addr, uint32_t block_num);
++extern int bk_sd_card_rw_sync(void);
 +extern uint32_t bk_sd_card_get_card_size(void);
 +// hal_ota_bk7231.c (the Wi-Fi OTA writer)
 +extern int init_ota(unsigned int startaddr);
@@ -1965,17 +2027,85 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +	return bk_sd_card_read_blocks(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
 +}
 +
++DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count)
++{
++	if (pdrv != 0 || !s_sdInit)
++		return RES_NOTRDY;
++	return bk_sd_card_write_blocks(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
++}
++
++// FAT timestamps: local time once NTP has synced, otherwise FatFs's fixed date
++DWORD get_fattime(void)
++{
++	struct tm t;
++	time_t now;
++	if (!TIME_IsTimeSynced())
++		return ((DWORD)(2026 - 1980) << 25) | (1 << 21) | (1 << 16);
++	now = (time_t)TIME_GetCurrentTime();
++	gmtime_r(&now, &t);
++	return ((DWORD)(t.tm_year - 80) << 25) | ((DWORD)(t.tm_mon + 1) << 21) | ((DWORD)t.tm_mday << 16)
++		| ((DWORD)t.tm_hour << 11) | ((DWORD)t.tm_min << 5) | ((DWORD)t.tm_sec >> 1);
++}
++
 +DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 +{
 +	if (pdrv != 0 || !s_sdInit)
 +		return RES_NOTRDY;
 +	switch (cmd) {
-+	case CTRL_SYNC: return RES_OK;
++	case CTRL_SYNC: bk_sd_card_rw_sync(); return RES_OK;   // ends an open multi-block write
 +	case GET_SECTOR_COUNT: *(LBA_t *)buff = bk_sd_card_get_card_size(); return RES_OK;
 +	case GET_SECTOR_SIZE: *(WORD *)buff = 512; return RES_OK;
 +	case GET_BLOCK_SIZE: *(DWORD *)buff = 1; return RES_OK;
 +	}
 +	return RES_PARERR;
++}
++
++// ---------------------------------------------------------------- shared mount
++// One FAT volume, mounted at boot and kept mounted; every FatFs call runs under s_sdMutex
++// (FatFs is built without its own locking). A failed write unmounts; the next use remounts,
++// at most every SD_REMOUNT_MS.
++#define SD_REMOUNT_MS 30000
++static FATFS s_fs;
++static int s_mounted;
++static UINT32 s_lastMountTry;
++static beken_mutex_t s_sdMutex;
++
++static void Sd_Lock(void)
++{
++	if (!s_sdMutex)
++		rtos_init_mutex(&s_sdMutex);
++	rtos_lock_mutex(&s_sdMutex);
++}
++static void Sd_Unlock(void) { rtos_unlock_mutex(&s_sdMutex); }
++
++static void Sd_Unmount(void)
++{
++	if (s_mounted)
++		f_mount(NULL, "", 0);
++	s_mounted = 0;
++	if (s_sdInit) {
++		bk_sd_card_deinit();
++		s_sdInit = 0;
++	}
++}
++
++// call with the lock held; returns FR_OK when the card is usable
++static FRESULT Sd_Mount(int force)
++{
++	UINT32 now = rtos_get_time();
++	FRESULT fr;
++	if (s_mounted)
++		return FR_OK;
++	if (!force && s_lastMountTry && now - s_lastMountTry < SD_REMOUNT_MS)
++		return FR_NOT_READY;
++	s_lastMountTry = now ? now : 1;
++	Sd_Unmount();
++	fr = f_mount(&s_fs, "", 1);
++	if (fr == FR_OK)
++		s_mounted = 1;
++	else
++		Sd_Unmount();
++	return fr;
 +}
 +
 +// ---------------------------------------------------------------- helpers
@@ -2034,7 +2164,6 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +}
 +
 +typedef struct {
-+	FATFS fs;
 +	FIL fil;
 +	DIR dir;
 +	FILINFO fno;
@@ -2146,7 +2275,8 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +	if (!c)
 +		return 0;
 +	memset(c, 0, sizeof(*c));
-+	FRESULT fr = f_mount(&c->fs, "", 1);
++	Sd_Lock();
++	FRESULT fr = Sd_Mount(1);
 +	if (fr != FR_OK) {
 +		if (verbose || mode)
 +			SDU_LOG("SD update: no card or no FAT32/exFAT file system (%s, err %d)",
@@ -2155,7 +2285,7 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +	}
 +	if (verbose || mode)
 +		SDU_LOG("SD card: %u MB, %s, running %s", (unsigned)(bk_sd_card_get_card_size() / 2048),
-+			c->fs.fs_type == FS_EXFAT ? "exFAT" : c->fs.fs_type == FS_FAT32 ? "FAT32" : "FAT12/16", CAM_FW_TAG);
++			s_fs.fs_type == FS_EXFAT ? "exFAT" : s_fs.fs_type == FS_FAT32 ? "FAT32" : "FAT12/16", CAM_FW_TAG);
 +	if (f_opendir(&c->dir, "/") == FR_OK) {
 +		while (f_readdir(&c->dir, &c->fno) == FR_OK && c->fno.fname[0]) {
 +			char ver[25];
@@ -2231,11 +2361,7 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +	if (guard != 0)
 +		HAL_FlashVars_SaveChannel(SDU_GUARD_CH, 0);
 +out:
-+	f_mount(NULL, "", 0);
-+	if (s_sdInit) {
-+		bk_sd_card_deinit();
-+		s_sdInit = 0;
-+	}
++	Sd_Unlock();
 +	os_free(c);
 +	return ret;
 +}
@@ -2266,6 +2392,386 @@ diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
 +{
 +	//cmddetail:{"name":"SdUpdate","args":"[install|force]","descr":"Firmware update from the microSD card (OpenBK7252N*.rbl in the root folder): show, install if newer, or install anyway","fn":"Sdu_Cmd","file":"driver/drv_bkCamSd.c","requires":"","examples":"SdUpdate install"}
 +	CMD_RegisterCommand("SdUpdate", Sdu_Cmd, NULL);
++}
++
++// ---------------------------------------------------------------- motion pictures
++// While motion is detected, drv_bkCam's recorder hands frames to BKCamSd_SaveJpeg: the first one
++// at once, then one every <interval> seconds. Files go to MOTION/<yyyy-mm-dd>/<hh-mm-ss>.jpg in
++// local time once NTP has synced (time zone taken from the browser on /cam, or CamTimezone),
++// before that to MOTION/B<boot number>/U<seconds since boot>.jpg. When the card gets full the
++// oldest folder is thinned out first (its files in directory = creation order).
++#define REC_CH          3       // retained: 0 = default, -1 = off, -2 = first frame only, n = every n s
++#define TZ_CH           4       // retained: UTC offset in minutes + 1 (0 = never set)
++#define REC_DIR         "MOTION"
++#define REC_DEFAULT_S   2
++#define REC_MIN_FREE_MB 16
++
++static int s_recInterval = REC_DEFAULT_S;  // < 0 off, 0 = first frame of each event only
++static UINT32 s_recSaved, s_recErrors, s_recDeleted;
++static char s_recLast[40];
++static UINT32 s_totalMB, s_freeMB;
++static FIL s_wf, s_rf;
++
++int BKCamSd_RecInterval(void) { return s_recInterval; }
++
++static void Sd_UpdateFree(void)
++{
++	DWORD fre;
++	FATFS *fs;
++	if (f_getfree("", &fre, &fs) == FR_OK) {
++		s_freeMB = (UINT32)((uint64_t)fre * fs->csize / 2048);
++		s_totalMB = (UINT32)((uint64_t)(fs->n_fatent - 2) * fs->csize / 2048);
++	}
++}
++
++static UINT32 Rec_MinFreeMB(void)
++{
++	UINT32 m = s_totalMB / 20;          // 5 %
++	return m > REC_MIN_FREE_MB ? m : REC_MIN_FREE_MB;
++}
++
++// delete up to 16 files of the oldest folder (the folder too once empty); 0 = nothing left
++static int Rec_DeleteSome(void)
++{
++	static DIR d;
++	static FILINFO fi;
++	char oldest[16] = "", path[48], names[16][16];
++	int n = 0, i;
++	if (f_opendir(&d, REC_DIR) != FR_OK)
++		return 0;
++	while (f_readdir(&d, &fi) == FR_OK && fi.fname[0])
++		if ((fi.fattrib & AM_DIR) && strlen(fi.fname) < sizeof(oldest) && (!oldest[0] || strcmp(fi.fname, oldest) < 0))
++			strcpy(oldest, fi.fname);
++	f_closedir(&d);
++	if (!oldest[0])
++		return 0;
++	snprintf(path, sizeof(path), REC_DIR "/%s", oldest);
++	if (f_opendir(&d, path) == FR_OK) {
++		while (n < 16 && f_readdir(&d, &fi) == FR_OK && fi.fname[0])
++			if (!(fi.fattrib & AM_DIR) && strlen(fi.fname) < sizeof(names[0]))
++				strcpy(names[n++], fi.fname);
++		f_closedir(&d);
++	}
++	for (i = 0; i < n; i++) {
++		snprintf(path, sizeof(path), REC_DIR "/%s/%s", oldest, names[i]);
++		if (f_unlink(path) == FR_OK)
++			s_recDeleted++;
++	}
++	if (n == 0) {
++		snprintf(path, sizeof(path), REC_DIR "/%s", oldest);
++		if (f_unlink(path) != FR_OK)
++			return 0;                    // e.g. a sub-folder someone put there: give up
++	}
++	return 1;
++}
++
++// Keep some free space; called by the recorder after each picture (lock not held).
++void BKCamSd_Housekeeping(void)
++{
++	int rounds = 0;
++	Sd_Lock();
++	if (s_mounted) {
++		Sd_UpdateFree();
++		while (s_freeMB < Rec_MinFreeMB() && rounds++ < 64 && Rec_DeleteSome()) {
++			Sd_UpdateFree();
++			HAL_Run_WDT();
++		}
++		if (rounds > 1)
++			ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam SD: card nearly full, deleted old pictures (%u MB free now)", s_freeMB);
++	}
++	Sd_Unlock();
++}
++
++static void Rec_Name(char *dir, int dlen, char *file, int flen)
++{
++	if (TIME_IsTimeSynced()) {
++		struct tm t;
++		time_t now = (time_t)TIME_GetCurrentTime();
++		gmtime_r(&now, &t);
++		snprintf(dir, dlen, REC_DIR "/%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
++		snprintf(file, flen, "%02d-%02d-%02d", t.tm_hour, t.tm_min, t.tm_sec);
++	} else {
++		snprintf(dir, dlen, REC_DIR "/B%05d", HAL_FlashVars_GetBootCount() % 100000);
++		snprintf(file, flen, "U%06u", (unsigned)(rtos_get_time() / 1000));
++	}
++}
++
++// Write one JPEG; out gets the path. Returns 0 on success.
++int BKCamSd_SaveJpeg(const UINT8 *data, UINT32 len, char *out, int outLen)
++{
++	char dir[24], base[16], path[48];
++	FRESULT fr;
++	UINT bw = 0;
++	int k;
++	Sd_Lock();
++	if (Sd_Mount(0) != FR_OK) {
++		Sd_Unlock();
++		return -1;
++	}
++	if (!s_totalMB)
++		Sd_UpdateFree();
++	Rec_Name(dir, sizeof(dir), base, sizeof(base));
++	f_mkdir(REC_DIR);
++	f_mkdir(dir);
++	for (k = 1; k < 10; k++) {
++		if (k == 1) snprintf(path, sizeof(path), "%s/%s.jpg", dir, base);
++		else snprintf(path, sizeof(path), "%s/%s_%d.jpg", dir, base, k);
++		fr = f_open(&s_wf, path, FA_WRITE | FA_CREATE_NEW);
++		if (fr != FR_EXIST)
++			break;
++	}
++	if (fr == FR_OK) {
++		fr = f_write(&s_wf, data, len, &bw);
++		FRESULT fc = f_close(&s_wf);
++		if (fr == FR_OK && (bw != len || fc != FR_OK))
++			fr = bw != len ? FR_DENIED : fc;   // FR_DENIED: card full
++	}
++	if (fr == FR_OK) {
++		s_recSaved++;
++		strncpy(s_recLast, path, sizeof(s_recLast) - 1);
++		if (out) { strncpy(out, path, outLen - 1); out[outLen - 1] = 0; }
++	} else {
++		s_recErrors++;
++		ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam SD: writing %s failed (FatFs error %d)", path, fr);
++		if (fr == FR_DISK_ERR || fr == FR_NOT_READY || fr == FR_INT_ERR || fr == FR_NO_FILESYSTEM)
++			Sd_Unmount();                  // card pulled or broken: remount later
++	}
++	Sd_Unlock();
++	return fr == FR_OK ? 0 : -1;
++}
++
++static void Rec_SetInterval(int v)
++{
++	s_recInterval = v;
++	HAL_FlashVars_SaveChannel(REC_CH, v < 0 ? -1 : v == 0 ? -2 : v);
++}
++
++// Time zone in minutes east of UTC; saved and applied to OpenBeken's clock.
++void BKCamSd_SetTimezone(int minutes, int save)
++{
++	if (minutes < -720 || minutes > 840)
++		return;
++	if (save && HAL_FlashVars_GetChannelValue(TZ_CH) != minutes + 1)
++		HAL_FlashVars_SaveChannel(TZ_CH, minutes + 1);
++	TIME_setDeviceTimeOffset(minutes * 60);
++}
++
++// ,"sd":{...} for /camstatus
++void BKCamSd_AppendStatus(http_request_t *request)
++{
++	hprintf255(request, ",\"sd\":{\"card\":%i,\"total\":%u,\"free\":%u,\"rec\":%i,\"saved\":%u,\"err\":%u,\"time\":%i}",
++		s_mounted, s_totalMB, s_freeMB, s_recInterval, s_recSaved, s_recErrors, TIME_IsTimeSynced() ? 1 : 0);
++}
++
++void BKCamSd_AppendIndex(http_request_t *request)
++{
++	if (s_mounted)
++		hprintf255(request, "<h5>SD card: %u of %u MB free, motion pictures: %s, %u saved this session - <a href='/motion'>view</a></h5>",
++			s_freeMB, s_totalMB, s_recInterval < 0 ? "off" : "on", s_recSaved);
++	else
++		poststr(request, "<h5>SD card: none</h5>");
++}
++
++// ---------------------------------------------------------------- web: /motion and /sd/<path>
++static int Sd_PathOk(const char *p)
++{
++	return p[0] && !strstr(p, "..") && !strchr(p, '\\') && strlen(p) < 64;
++}
++
++static void Sd_CopyPath(char *dst, int n, const char *url, const char *prefix)
++{
++	int i = 0;
++	url += strlen(prefix);
++	while (*url && *url != '?' && i < n - 1) dst[i++] = *url++;
++	dst[i] = 0;
++}
++
++static int Sd_HttpFile(http_request_t *request)
++{
++	char path[64], hdr[200];
++	FRESULT fr;
++	Sd_CopyPath(path, sizeof(path), request->url, "sd/");
++	if (!Sd_PathOk(path)) {
++		http_setup(request, httpMimeTypeText);
++		poststr(request, "bad path");
++		poststr(request, NULL);
++		return 0;
++	}
++	Sd_Lock();
++	fr = Sd_Mount(0);
++	if (fr == FR_OK)
++		fr = f_open(&s_rf, path, FA_READ);
++	if (fr != FR_OK) {
++		Sd_Unlock();
++		http_setup(request, httpMimeTypeText);
++		poststr(request, s_mounted ? "no such file" : "no SD card");
++		poststr(request, NULL);
++		return 0;
++	}
++	FSIZE_t size = f_size(&s_rf);
++	int jpg = strlen(path) > 4 && !stricmp(path + strlen(path) - 4, ".jpg");
++	int n = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\n"
++		"Cache-Control: max-age=86400\r\nConnection: close\r\n\r\n", jpg ? "image/jpeg" : "application/octet-stream", (unsigned)size);
++	Sd_Unlock();
++	int ok = send(request->fd, hdr, n, 0) == n;
++	static UINT8 buf[2048];
++	while (ok) {
++		UINT br = 0;
++		Sd_Lock();
++		fr = s_mounted ? f_read(&s_rf, buf, sizeof(buf), &br) : FR_NOT_READY;
++		Sd_Unlock();
++		if (fr != FR_OK || br == 0)
++			break;
++		for (UINT o = 0; o < br; ) {
++			int w = send(request->fd, buf + o, br - o, 0);
++			if (w <= 0) { ok = 0; break; }
++			o += w;
++		}
++	}
++	Sd_Lock();
++	if (s_mounted)
++		f_close(&s_rf);
++	Sd_Unlock();
++	return 0;
++}
++
++// names sorted newest first (plain string order, reversed)
++static int Sd_CmpDesc(const void *a, const void *b) { return strcmp((const char *)b, (const char *)a); }
++
++#define SD_LIST_MAX 120
++static int Sd_HttpMotion(http_request_t *request)
++{
++	char day[16] = "", path[48];
++	static DIR d;
++	static FILINFO fi;
++	char (*names)[16];
++	int n = 0, total = 0, i;
++	http_getArg(request->url, "d", day, sizeof(day));
++	if (day[0] && (!Sd_PathOk(day) || strchr(day, '/')))
++		day[0] = 0;
++	http_setup(request, httpMimeTypeHTML);
++	poststr(request, "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width'>"
++		"<title>Motion pictures</title><style>body{margin:0;background:#111;color:#ccc;font-family:sans-serif}"
++		".w{max-width:980px;margin:0 auto;padding:8px 12px}a{color:#8cf}"
++		".g{display:flex;flex-wrap:wrap;gap:6px}.g a{display:block;width:156px;font-size:12px;text-align:center;text-decoration:none}"
++		".g img{width:156px;height:117px;object-fit:cover;background:#222;display:block}"
++		"li{margin:6px 0}</style></head><body><div class='w'>");
++	names = os_malloc(SD_LIST_MAX * 16);
++	Sd_Lock();
++	FRESULT fr = Sd_Mount(0);
++	if (fr == FR_OK && names) {
++		snprintf(path, sizeof(path), day[0] ? REC_DIR "/%s" : REC_DIR, day);
++		if (f_opendir(&d, path) == FR_OK) {
++			while (f_readdir(&d, &fi) == FR_OK && fi.fname[0]) {
++				if (strlen(fi.fname) >= 16 || ((fi.fattrib & AM_DIR) ? 1 : 0) != (day[0] ? 0 : 1))
++					continue;
++				total++;
++				if (n < SD_LIST_MAX) {
++					strcpy(names[n++], fi.fname);
++				} else {                        // keep the newest SD_LIST_MAX names
++					int lo = 0;
++					for (i = 1; i < n; i++) if (strcmp(names[i], names[lo]) < 0) lo = i;
++					if (strcmp(fi.fname, names[lo]) > 0) strcpy(names[lo], fi.fname);
++				}
++			}
++			f_closedir(&d);
++		}
++	}
++	Sd_Unlock();
++	if (fr != FR_OK) {
++		poststr(request, "<h3>Motion pictures</h3><p>No SD card (or no FAT32/exFAT file system on it).</p>");
++	} else if (!day[0]) {
++		hprintf255(request, "<h3>Motion pictures</h3><p>SD card: %u of %u MB free &middot; %s &middot; "
++			"<a href='/cam'>camera</a></p><ul>", s_freeMB, s_totalMB,
++			s_recInterval < 0 ? "recording off" : "recording on");
++		qsort(names, n, 16, Sd_CmpDesc);
++		for (i = 0; i < n; i++)
++			hprintf255(request, "<li><a href='/motion?d=%s'>%s</a></li>", names[i], names[i]);
++		if (!n)
++			poststr(request, "<li>none yet</li>");
++		poststr(request, "</ul>");
++	} else {
++		hprintf255(request, "<h3>%s</h3><p><a href='/motion'>all days</a> &middot; %d pictures%s</p><div class='g'>",
++			day, total, total > n ? ", newest shown" : "");
++		qsort(names, n, 16, Sd_CmpDesc);
++		for (i = 0; i < n; i++)
++			hprintf255(request, "<a href='/sd/" REC_DIR "/%s/%s'><img loading=lazy src='/sd/" REC_DIR "/%s/%s'>%s</a>",
++				day, names[i], day, names[i], names[i]);
++		poststr(request, "</div>");
++	}
++	poststr(request, "</div></body></html>");
++	poststr(request, NULL);
++	if (names)
++		os_free(names);
++	return 0;
++}
++
++// CamRec              -> show
++// CamRec off | on     -> motion pictures off / on (every 2 s while motion lasts)
++// CamRec <seconds>    -> on, one picture every <seconds> (0 = only the first of each event)
++static commandResult_t Rec_Cmd(const void *context, const char *cmd, const char *args, int flags)
++{
++	Tokenizer_TokenizeString(args, 0);
++	if (Tokenizer_GetArgsCount() >= 1) {
++		const char *a = Tokenizer_GetArg(0);
++		if (!stricmp(a, "off")) Rec_SetInterval(-1);
++		else if (!stricmp(a, "on")) Rec_SetInterval(REC_DEFAULT_S);
++		else if (*a >= '0' && *a <= '9' && atoi(a) <= 3600) Rec_SetInterval(atoi(a));
++		else return CMD_RES_BAD_ARGUMENT;
++	}
++	Sd_Lock();
++	if (Sd_Mount(1) == FR_OK)
++		Sd_UpdateFree();
++	Sd_Unlock();
++	ADDLOG_INFO(LOG_FEATURE_CMD, "CamRec: %s; card %s, %u of %u MB free; %u saved, %u errors, %u deleted; last %s; clock %s",
++		s_recInterval < 0 ? "off" : s_recInterval == 0 ? "first picture of each motion event" : "on",
++		s_mounted ? "ok" : "none", s_freeMB, s_totalMB, s_recSaved, s_recErrors, s_recDeleted,
++		s_recLast[0] ? s_recLast : "-", TIME_IsTimeSynced() ? "synced" : "not synced (files go to MOTION/B<boot>)");
++	if (s_recInterval > 0)
++		ADDLOG_INFO(LOG_FEATURE_CMD, "CamRec: one picture every %d s while motion lasts", s_recInterval);
++	return CMD_RES_OK;
++}
++
++// CamTimezone [+hh:mm | minutes]
++static commandResult_t Tz_Cmd(const void *context, const char *cmd, const char *args, int flags)
++{
++	Tokenizer_TokenizeString(args, 0);
++	if (Tokenizer_GetArgsCount() >= 1) {
++		const char *a = Tokenizer_GetArg(0);
++		int sign = 1, h = 0, m = 0;
++		if (*a == '+' || *a == '-') { sign = *a == '-' ? -1 : 1; a++; }
++		if (strchr(a, ':')) { sscanf(a, "%d:%d", &h, &m); m = h * 60 + m; }
++		else m = atoi(a) * 60;
++		BKCamSd_SetTimezone(sign * m, 1);
++	}
++	int v = HAL_FlashVars_GetChannelValue(TZ_CH) - 1;
++	ADDLOG_INFO(LOG_FEATURE_CMD, "CamTimezone: UTC%c%d:%02d%s, clock %s", v < 0 ? '-' : '+', abs(v) / 60, abs(v) % 60,
++		HAL_FlashVars_GetChannelValue(TZ_CH) ? "" : " (not set)", TIME_IsTimeSynced() ? "synced" : "not synced");
++	return CMD_RES_OK;
++}
++
++// At boot, after BKCam_SdUpdate: settings, commands, web pages. The card stays mounted.
++void BKCamSd_Start(void)
++{
++	int v = HAL_FlashVars_GetChannelValue(REC_CH);
++	if (v == -1) s_recInterval = -1;
++	else if (v == -2) s_recInterval = 0;
++	else if (v >= 1 && v <= 3600) s_recInterval = v;
++	v = HAL_FlashVars_GetChannelValue(TZ_CH);
++	if (v)
++		BKCamSd_SetTimezone(v - 1, 0);
++	Sd_Lock();
++	if (Sd_Mount(0) == FR_OK)
++		Sd_UpdateFree();
++	Sd_Unlock();
++	//cmddetail:{"name":"CamRec","args":"[on|off|seconds]","descr":"Motion pictures on the SD card: show, on/off, or one picture every n seconds while motion lasts (0 = first only)","fn":"Rec_Cmd","file":"driver/drv_bkCamSd.c","requires":"","examples":"CamRec 5"}
++	CMD_RegisterCommand("CamRec", Rec_Cmd, NULL);
++	//cmddetail:{"name":"CamTimezone","args":"[+hh:mm]","descr":"Time zone for picture names (saved; /cam sets it from the browser)","fn":"Tz_Cmd","file":"driver/drv_bkCamSd.c","requires":"","examples":"CamTimezone +4"}
++	CMD_RegisterCommand("CamTimezone", Tz_Cmd, NULL);
++	HTTP_RegisterCallback("/motion", HTTP_GET, Sd_HttpMotion, 1);
++	HTTP_RegisterCallback("/sd/", HTTP_GET, Sd_HttpFile, 1);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam SD: %s, motion pictures %s", s_mounted ? "card mounted" : "no card",
++		s_recInterval < 0 ? "off" : "on");
 +}
 +#endif
 diff -ruN pa3/src/driver/drv_local.h pb3/src/driver/drv_local.h
