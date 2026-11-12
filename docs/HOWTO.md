@@ -41,17 +41,17 @@ git submodule update --init sdk/beken_freertos_sdk libraries/berry   # Beken SDK
 
 ```sh
 cd ~/cam/bk7252n-camera/openbk-port
-./docker_build.sh 1.5.0          # pick a new version number each time
+./docker_build.sh 1.5.2          # pick a new version number each time
 ```
 
 The first run also builds the Docker image, which takes a few minutes. The results are:
 
 ```
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.0_crc.bin   UART image (0x121000 bytes), flash at 0x11000
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.0.rbl       OTA package (~500 KB)
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.2_crc.bin   UART image (0x121000 bytes), flash at 0x11000
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.2.rbl       OTA package (~500 KB)
 ```
 
-The version also appears on the camera's main page and `/cam` page as "fw 1.5.0", so you can see
+The version also appears on the camera's main page and `/cam` page as "fw 1.5.2", so you can see
 which build is running.
 
 ### Build on x86-64 Linux
@@ -59,7 +59,7 @@ which build is running.
 You need `make`, `python3`, `patch` and `xz`. Then:
 
 ```sh
-sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.5.0
+sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.5.2
 ```
 
 ### What the build script does
@@ -142,7 +142,7 @@ is built in for this and for the motion pictures (`openbk-port/fatfs/`).
 
 ```sh
 cd ~/cam/bk7252n-camera
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.0_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.2_crc.bin
 ```
 
 0. **First time only: backup.** If `backups/` has no backup of this camera yet, the script first
@@ -177,9 +177,9 @@ With the Arduino relay on `/dev/cu.usbserial-140` and the agent running
 typing commands. Drop JSON files into `lab/jobs/`, for example:
 
 ```json
-{"action": "flash", "image": "build-openbk/OpenBK7252N_1.5.0_crc.bin"}
+{"action": "flash", "image": "build-openbk/OpenBK7252N_1.5.2_crc.bin"}
 {"action": "cycle_capture", "seconds": 30, "off_s": 3}
-{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.5.0_crc.bin"]}
+{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.5.2_crc.bin"]}
 ```
 
 Results appear in `lab/results/`. The agent power-cycles the camera into the bootloader itself and
@@ -267,6 +267,7 @@ command line:
 | `PowerOff` | switch off, the same as holding Power |
 | `CamAudio [gain] [threshold]` | microphone digital gain (default x8) and sound-detection threshold (default 120); prints the level |
 | `BKAudioRec <s>` | with BKAudio started and open: record up to 3 s and print it as hex (bring-up) |
+| `CamMotion on\|off` | motion detection on / off (off by default) |
 | `CamMotion [sensitivity] [area]` | motion detection: grey-level difference (default 25) and area in 0.1 % (default 20 = 2 %); prints the state |
 | `CamBattery` | battery voltage, percent, raw ADC value, scale and cut-off |
 | `CamBattery cal <mV>` | calibrate against a multimeter reading taken right now |
@@ -295,6 +296,10 @@ and `http://<ip>/camaudio?gain=8&thr=120` (JSON) do the same.
 
 ### Motion detection
 
+Motion detection is **off by default** (it costs CPU time and battery). Turn it on with the
+**Motion** checkbox on `/cam`, `CamMotion on` or `/cammotion?en=1`; the setting is kept
+(retained channel 2). While it is off there are no motion events, MQTT messages or SD pictures.
+
 There is no PIR sensor, so motion is detected from the video. Twice a second the newest JPEG is
 decoded at 1/8 scale into an 80×60 grey image (TJpgDec) and compared with a slowly updated
 background; brightness changes of the whole picture are compensated. A pixel counts as changed
@@ -302,12 +307,12 @@ when it differs by more than the **sensitivity** (default 25 of 255); there is m
 than the **area** (default 2 % of the picture) changed. "Motion detected" / "motion ended"
 appear in the log, on the main page, and as the MQTT topic `<client>/motion` (1/0).
 
-`/cam` has two sliders, **Motion diff** and **Motion area**. Changes are stored in retained
+`/cam` has the on/off checkbox and two sliders, **Motion diff** and **Motion area**. Changes are stored in retained
 channels 8 and 9; `CamMotion <sensitivity> <area>` and `/cammotion?pix=25&area=20` do the same.
 
 ### Motion pictures on the SD card
 
-With a microSD card (FAT32 or exFAT) in the camera, every motion event is saved as JPEG
+With a microSD card (FAT32 or exFAT) in the camera and motion detection on, every motion event is saved as JPEG
 pictures: the first frame as soon as motion is detected, then one every 2 s while it lasts.
 
 - Files: `MOTION/<yyyy-mm-dd>/<hh-mm-ss>.jpg` in local time. The camera starts NTP by itself

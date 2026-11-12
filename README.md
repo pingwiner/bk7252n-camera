@@ -10,7 +10,7 @@ Local, cloud-free firmware for a Wi-Fi security camera built on the **Beken BK72
 |---|---|
 | **Video** | 640×480 MJPEG at 10 fps: `/cam` viewer, `/stream`, `/snapshot.jpg` (browsers, VLC, Android MJPEG apps) |
 | **Audio** | microphone as endless WAV (`/audio.wav`), sound detection, gain and threshold sliders |
-| **Motion** | video-based motion detection (no PIR), adjustable sensitivity and area; pictures of each event saved to the microSD card (`/motion` page) |
+| **Motion** | video-based motion detection (no PIR, off by default, checkbox on `/cam`), adjustable sensitivity and area; pictures of each event saved to the microSD card (`/motion` page) |
 | **MQTT** | `<client>/motion`, `motion_file`, `sound`, `battery`, `battery_pct`, `battery_low` |
 | **Battery** | voltage and percent on the pages and MQTT; deep sleep below 3.45 V instead of a brownout reboot loop |
 | **Buttons** | Power: hold 2 s = off / on. Mode: hold 2 s = forget Wi-Fi and open the setup access point |
@@ -54,13 +54,13 @@ git -C OpenBK7231T_App checkout 168cba55
 git -C OpenBK7231T_App submodule update --init sdk/beken_freertos_sdk libraries/berry
 git -C OpenBK7231T_App/sdk/beken_freertos_sdk checkout f5a64d4
 
-# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.5.0)
+# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.5.2)
 cd bk7252n-camera
-openbk-port/docker_build.sh 1.5.0        # -> build-openbk/OpenBK7252N_1.5.0_crc.bin and .rbl
+openbk-port/docker_build.sh 1.5.2        # -> build-openbk/OpenBK7252N_1.5.2_crc.bin and .rbl
 
 # flash over UART the first time (3.3 V adapter, camera on its battery), then OTA from the web page
 python3 -m venv .venv && .venv/bin/pip install -r tools/flasher/requirements.txt
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.0_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.2_crc.bin
 ```
 
 The build applies the patch to `OpenBK7231T_App` (it changes that checkout) and takes about a

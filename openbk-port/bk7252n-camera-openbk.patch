@@ -566,8 +566,8 @@ diff -ruN pa3/src/driver/drv_audio.c pb3/src/driver/drv_audio.c
  	//cmddetail:"fn":"CMD_BKAudioOpen","file":"driver/drv_audio.c","requires":"",
 diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 --- a/src/driver/drv_bkCam.c	1970-01-01 04:00:00.000000000 +0400
-+++ b/src/driver/drv_bkCam.c	2026-11-13 00:06:47.006988813 +0400
-@@ -0,0 +1,1373 @@
++++ b/src/driver/drv_bkCam.c	2026-11-13 00:37:38.081773146 +0400
+@@ -0,0 +1,1407 @@
 +// BK7252N DVP camera (GC0329 on the security-camera board): JPEG frames from the on-chip encoder,
 +// served as /snapshot.jpg, an MJPEG /stream and a /cam page.
 +//
@@ -849,9 +849,10 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		"<label><span>Mic gain</span><input id='g' type='range' min='1' max='32' step='1'><b id='gv'></b></label>"
 +		"<label><span>Threshold</span><input id='t' type='range' min='20' max='2000' step='10'><b id='tv'></b></label>"
 +		"<div id='bar'><div id='lv'></div><div id='th'></div></div><div id='st'>&nbsp;</div>"
-+		"<label><span>Motion diff</span><input id='mp' type='range' min='3' max='128' step='1'><b id='mpv'></b></label>"
++		"<label><span>Motion</span><input id='me' type='checkbox' style='margin:0'><i style='font-style:normal;font-size:13px;color:#999'>detect motion (and save pictures to the SD card)</i></label>"
++		"<div id='mbox'><label><span>Motion diff</span><input id='mp' type='range' min='3' max='128' step='1'><b id='mpv'></b></label>"
 +		"<label><span>Motion area</span><input id='ma' type='range' min='1' max='200' step='1'><b id='mav'></b></label>"
-+		"<div id='mbar'><div id='mlv'></div><div id='mth'></div></div><div id='mst'>&nbsp;</div>"
++		"<div id='mbar'><div id='mlv'></div><div id='mth'></div></div><div id='mst'>&nbsp;</div></div>"
 +		"<p><span id='bat'></span><span id='sd'></span><a href='/motion'>motion pictures</a> &middot; <a href='/snapshot.jpg'>snapshot</a> &middot; <a href='/index'>device</a> &middot; " CAM_FW_TAG "</p></div>");
 +	poststr(request, "<script>"
 +		"var g=document.getElementById('g'),t=document.getElementById('t'),busy=0;"
@@ -867,10 +868,13 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		"g.oninput=t.oninput=function(){show()};"
 +		"g.onchange=t.onchange=function(){poll('?gain='+g.value+'&thr='+t.value)};"
 +		"var mp=document.getElementById('mp'),ma=document.getElementById('ma'),mbusy=0;"
++		"var me=document.getElementById('me'),mbox=document.getElementById('mbox');"
 +		"function mshow(d){document.getElementById('mpv').textContent=mp.value;"
++		"if(d&&d.en!==undefined){me.checked=!!d.en;mbox.style.opacity=d.en?1:.4;}"
 +		"document.getElementById('mav').textContent=(ma.value/10).toFixed(1)+'%';"
 +		"var m=Math.max(100,3*ma.value);document.getElementById('mth').style.left=Math.min(100,100*ma.value/m)+'%';"
-+		"if(d){document.getElementById('mlv').style.width=Math.min(100,100*d.changed/m)+'%';"
++		"if(d&&!d.en){document.getElementById('mlv').style.width=0;document.getElementById('mst').textContent='motion detection is off';}"
++		"else if(d){document.getElementById('mlv').style.width=Math.min(100,100*d.changed/m)+'%';"
 +		"document.getElementById('mlv').style.background=d.motion?'#e94':'#4c8';"
 +		"document.getElementById('mst').textContent='changed '+(d.changed/10).toFixed(1)+'%  -  '+(d.motion?'MOTION DETECTED':'no motion')+'  -  '+d.events+' events';}}"
 +		"function mpoll(set){if(mbusy&&!set)return;mbusy=1;fetch('/cammotion'+(set||'')).then(function(r){return r.json()}).then(function(d){"
@@ -882,6 +886,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		"if(d.sd)document.getElementById('sd').textContent=d.sd.card?'SD '+d.sd.free+' MB free, '+(d.sd.rec<0?'pictures off':d.sd.saved+' saved')+' \u00b7 ':'no SD card \u00b7 ';sbusy=0}).catch(function(){sbusy=0})}"
 +		"mp.oninput=ma.oninput=function(){mshow()};"
 +		"mp.onchange=ma.onchange=function(){mpoll('?pix='+mp.value+'&area='+ma.value)};"
++		"me.onchange=function(){mbox.style.opacity=me.checked?1:.4;mpoll('?en='+(me.checked?1:0))};"
 +		"spoll();setInterval(spoll,1000);"
 +		"</script></body></html>");
 +	poststr(request, NULL);
@@ -1307,10 +1312,12 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +#define MOT_PERIOD_MS 500
 +#define MOT_SAVE_PIX_CH   8
 +#define MOT_SAVE_AREA_CH  9
++#define MOT_SAVE_EN_CH    2         // 1 = motion detection on; 0 (never set) = off
 +static int g_motPix = 25;          // grey-level difference that counts as a change (0..255)
 +static int g_motArea = 20;         // changed area that counts as motion, in 0.1 % (20 = 2 %)
 +static volatile int g_motChanged;  // last changed area, 0.1 %
 +static volatile int g_motActive;
++static volatile int g_motEnabled;   // off by default: decoding costs CPU and battery
 +static UINT32 g_motEvents, g_motFrames, g_motErrors;
 +static UINT8 *g_motCur;
 +static UINT16 *g_motBg;            // background x16
@@ -1386,6 +1393,13 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	int hits = 0, quiet = 0;
 +	for (;;) {
 +		rtos_delay_milliseconds(MOT_PERIOD_MS);
++		if (!g_motEnabled) {
++			if (g_motActive) Mot_Event(0);
++			g_motBgValid = 0;               // fresh background when switched on again
++			g_motChanged = 0;
++			hits = quiet = 0;
++			continue;
++		}
 +		if (!g_running)
 +			continue;
 +		int b = Cam_Acquire(&last, 1000);
@@ -1476,12 +1490,23 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	}
 +}
 +
++static void Mot_Enable(int on)
++{
++	on = on ? 1 : 0;
++	if (on == g_motEnabled)
++		return;
++	g_motEnabled = on;
++	HAL_FlashVars_SaveChannel(MOT_SAVE_EN_CH, on);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam: motion detection %s", on ? "on" : "off");
++}
++
 +static void Mot_Start(void)
 +{
 +	int p = HAL_FlashVars_GetChannelValue(MOT_SAVE_PIX_CH);
 +	int a = HAL_FlashVars_GetChannelValue(MOT_SAVE_AREA_CH);
 +	if (p >= 3 && p <= 128) g_motPix = p;
 +	if (a >= 1 && a <= 500) g_motArea = a;
++	g_motEnabled = HAL_FlashVars_GetChannelValue(MOT_SAVE_EN_CH) == 1;
 +	g_motCur = (UINT8 *)os_malloc(MOT_N);
 +	g_motBg = (UINT16 *)os_malloc(MOT_N * sizeof(UINT16));
 +	if (!g_motCur || !g_motBg) {
@@ -1489,8 +1514,8 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		return;
 +	}
 +	rtos_create_thread(NULL, BEKEN_APPLICATION_PRIORITY, "cammotion", Mot_Task, 3072, NULL);
-+	ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam: motion detection on (sensitivity %i, area %i.%i %%)",
-+		g_motPix, g_motArea / 10, g_motArea % 10);
++	ADDLOG_INFO(LOG_FEATURE_DRV, "BKCam: motion detection %s (sensitivity %i, area %i.%i %%)",
++		g_motEnabled ? "on" : "off", g_motPix, g_motArea / 10, g_motArea % 10);
 +}
 +
 +// /cammotion[?pix=N&area=N] - set (optional) and report motion detection as JSON
@@ -1501,9 +1526,11 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	int a = http_getArg(request->url, "area", tmp, sizeof(tmp)) ? atoi(tmp) : 0;
 +	if (p || a)
 +		Mot_Set(p, a);
++	if (http_getArg(request->url, "en", tmp, sizeof(tmp)))
++		Mot_Enable(atoi(tmp));
 +	http_setup(request, "application/json");
-+	hprintf255(request, "{\"pix\":%i,\"area\":%i,\"changed\":%i,\"motion\":%i,\"events\":%u,\"frames\":%u,\"errors\":%u}",
-+		g_motPix, g_motArea, g_motChanged, g_motActive, g_motEvents, g_motFrames, g_motErrors);
++	hprintf255(request, "{\"en\":%i,\"pix\":%i,\"area\":%i,\"changed\":%i,\"motion\":%i,\"events\":%u,\"frames\":%u,\"errors\":%u}",
++		g_motEnabled, g_motPix, g_motArea, g_motChanged, g_motActive, g_motEvents, g_motFrames, g_motErrors);
 +	poststr(request, NULL);
 +	return 0;
 +}
@@ -1788,8 +1815,8 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	http_setup(request, "application/json");
 +	hprintf255(request, "{\"a\":{\"gain\":%i,\"thr\":%i,\"rms\":%i,\"peak\":%i,\"sound\":%i,\"events\":%u,\"mic\":%i},",
 +		g_audGain, g_sndThresh, g_sndRms, g_sndPeak, g_sndActive, g_sndEvents, g_audH != DD_HANDLE_UNVALID);
-+	hprintf255(request, "\"m\":{\"pix\":%i,\"area\":%i,\"changed\":%i,\"motion\":%i,\"events\":%u},",
-+		g_motPix, g_motArea, g_motChanged, g_motActive, g_motEvents);
++	hprintf255(request, "\"m\":{\"en\":%i,\"pix\":%i,\"area\":%i,\"changed\":%i,\"motion\":%i,\"events\":%u},",
++		g_motEnabled, g_motPix, g_motArea, g_motChanged, g_motActive, g_motEvents);
 +	hprintf255(request, "\"b\":{\"mv\":%i,\"pct\":%i,\"raw\":%i,\"cutoff\":%i}",
 +		g_batMv, g_batPct, g_batRaw, Bat_CutoffActive() ? g_batCutoff : 0);
 +	BKCamSd_AppendStatus(request);
@@ -1802,10 +1829,13 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +static commandResult_t Cam_Cmd_Motion(const void *context, const char *cmd, const char *args, int flags)
 +{
 +	Tokenizer_TokenizeString(args, 0);
-+	Mot_Set(Tokenizer_GetArgsCount() >= 1 ? Tokenizer_GetArgInteger(0) : 0,
-+		Tokenizer_GetArgsCount() >= 2 ? Tokenizer_GetArgInteger(1) : 0);
-+	ADDLOG_INFO(LOG_FEATURE_CMD, "CamMotion: sensitivity %i, area %i.%i %%, changed %i.%i %%, motion %i, events %u, frames %u, errors %u",
-+		g_motPix, g_motArea / 10, g_motArea % 10, g_motChanged / 10, g_motChanged % 10, g_motActive,
++	if (Tokenizer_GetArgsCount() >= 1 && (!stricmp(Tokenizer_GetArg(0), "on") || !stricmp(Tokenizer_GetArg(0), "off")))
++		Mot_Enable(!stricmp(Tokenizer_GetArg(0), "on"));
++	else
++		Mot_Set(Tokenizer_GetArgsCount() >= 1 ? Tokenizer_GetArgInteger(0) : 0,
++			Tokenizer_GetArgsCount() >= 2 ? Tokenizer_GetArgInteger(1) : 0);
++	ADDLOG_INFO(LOG_FEATURE_CMD, "CamMotion: %s, sensitivity %i, area %i.%i %%, changed %i.%i %%, motion %i, events %u, frames %u, errors %u",
++		g_motEnabled ? "on" : "off", g_motPix, g_motArea / 10, g_motArea % 10, g_motChanged / 10, g_motChanged % 10, g_motActive,
 +		g_motEvents, g_motFrames, g_motErrors);
 +	return CMD_RES_OK;
 +}
@@ -1858,11 +1888,13 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	}
 +	HTTP_RegisterCallback("/snapshot.jpg", HTTP_GET, Cam_HttpSnapshot, 0);
 +	HTTP_RegisterCallback("/stream", HTTP_GET, Cam_HttpStream, 0);
-+	HTTP_RegisterCallback("/cam", HTTP_GET, Cam_HttpPage, 0);
++	// OpenBeken matches callback URLs by prefix, first registered first: "/cam" must come after
++	// "/camaudio", "/cammotion" and "/camstatus" or it answers those requests with the page.
 +	HTTP_RegisterCallback("/audio.wav", HTTP_GET, Aud_HttpWav, 0);
 +	HTTP_RegisterCallback("/camaudio", HTTP_GET, Aud_HttpJson, 0);
 +	HTTP_RegisterCallback("/cammotion", HTTP_GET, Mot_HttpJson, 0);
 +	HTTP_RegisterCallback("/camstatus", HTTP_GET, Cam_HttpStatus, 0);
++	HTTP_RegisterCallback("/cam", HTTP_GET, Cam_HttpPage, 0);
 +	//cmddetail:{"name":"CamStart","args":"","descr":"Start the DVP camera and JPEG encoder","fn":"Cam_Cmd_Start","file":"driver/drv_bkCam.c","requires":"","examples":""}
 +	CMD_RegisterCommand("CamStart", Cam_Cmd_Start, NULL);
 +	//cmddetail:{"name":"CamStop","args":"","descr":"Stop the camera","fn":"Cam_Cmd_Stop","file":"driver/drv_bkCam.c","requires":"","examples":""}
@@ -1879,7 +1911,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	CMD_RegisterCommand("PowerOff", Cam_Cmd_PowerOff, NULL);
 +	//cmddetail:{"name":"CamAudio","args":"[gain] [threshold]","descr":"Microphone digital gain (x1..x32) and sound-detection RMS threshold; prints the level","fn":"Cam_Cmd_Audio","file":"driver/drv_bkCam.c","requires":"","examples":"CamAudio 8 1500"}
 +	CMD_RegisterCommand("CamAudio", Cam_Cmd_Audio, NULL);
-+	//cmddetail:{"name":"CamMotion","args":"[sensitivity] [area]","descr":"Video motion detection: grey-level difference 3..128 and changed area in 0.1 % (1..500); prints the state","fn":"Cam_Cmd_Motion","file":"driver/drv_bkCam.c","requires":"","examples":"CamMotion 25 20"}
++	//cmddetail:{"name":"CamMotion","args":"[on|off] | [sensitivity] [area]","descr":"Video motion detection (off by default): on/off, or grey-level difference 3..128 and changed area in 0.1 % (1..500); prints the state","fn":"Cam_Cmd_Motion","file":"driver/drv_bkCam.c","requires":"","examples":"CamMotion 25 20"}
 +	CMD_RegisterCommand("CamMotion", Cam_Cmd_Motion, NULL);
 +	//cmddetail:{"name":"CamBattery","args":"[cal mV | cutoff mV]","descr":"Battery voltage; calibrate against a meter reading, or set the deep-sleep cut-off (0 = off)","fn":"Cam_Cmd_Battery","file":"driver/drv_bkCam.c","requires":"","examples":"CamBattery cal 4100"}
 +	CMD_RegisterCommand("CamBattery", Cam_Cmd_Battery, NULL);
@@ -1933,7 +1965,9 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	if (g_batMv >= 0)
 +		hprintf255(request, "<h5>Battery: %i.%02i V, %i %%%s</h5>", g_batMv / 1000, (g_batMv % 1000) / 10, g_batPct,
 +			Bat_CutoffActive() ? "" : " (cut-off inactive)");
-+	hprintf255(request, "<h5>Motion: %s, %i.%i %% changed (trigger %i.%i %%), %u events</h5>",
++	if (!g_motEnabled)
++		poststr(request, "<h5>Motion detection: off (turn it on on the <a href='/cam'>camera page</a>)</h5>");
++	else hprintf255(request, "<h5>Motion: %s, %i.%i %% changed (trigger %i.%i %%), %u events</h5>",
 +		g_motActive ? "DETECTED" : "none", g_motChanged / 10, g_motChanged % 10, g_motArea / 10, g_motArea % 10, g_motEvents);
 +	BKCamSd_AppendIndex(request);
 +	hprintf255(request, "<h5>Microphone: %s, level %i (threshold %i), sound %s, %u events - <a href='/audio.wav'>listen</a></h5>",
