@@ -73,10 +73,6 @@ puts the original firmware back; `./camera_flash.sh backup` does the read on its
 backup private, and never write one camera's backup to another: the factory config area
 (0x1F0000 and up) holds that camera's MAC and vendor keys.
 
-## Not in this repository
-
-Flash backups, UART logs, lab results and built images are ignored (`.gitignore`): backups and
-logs contain Wi-Fi credentials and device keys.
 
 ## Credits 
 
