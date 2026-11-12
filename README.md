@@ -15,7 +15,7 @@ Local, cloud-free firmware for a Wi-Fi security camera built on the **Beken BK72
 | **Battery** | voltage and percent on the pages and MQTT; deep sleep below 3.45 V instead of a brownout reboot loop |
 | **Buttons** | Power: hold 2 s = off / on. Mode: hold 2 s = forget Wi-Fi and open the setup access point |
 | **Network** | joins your Wi-Fi; found as `http://<short name>.local` (mDNS); setup page tells the user where to find it |
-| **Updates** | OTA over Wi-Fi through the factory bootloader; UART flashing for first install and recovery |
+| **Updates** | OTA over Wi-Fi or from a microSD card (newer `OpenBK7252N*.rbl` in the root folder, installed at boot), both through the factory bootloader; UART flashing for first install and recovery |
 | **Consoles** | UART (115200) and TCP port 100 (flag 5), `help [text]` lists commands |
 | **MAC** | the camera's own MAC from the factory config sector instead of the SDK's shared default |
 
@@ -27,6 +27,7 @@ web-app URL, most flags) are hidden.
 | Path | |
 |---|---|
 | `openbk-port/bk7252n-camera-openbk.patch` | all changes to `OpenBK7231T_App` and its Beken SDK (`patch -p1`) |
+| `openbk-port/fatfs/` | ChaN's FatFs R0.16 (read-only, `obk_`-prefixed) for the SD-card update; copied into the build |
 | `openbk-port/build_camera_fw.sh` | applies the patch, unpacks the SDK toolchain, builds `OpenBK7252N_<ver>_crc.bin` (UART) and `.rbl` (OTA) |
 | `openbk-port/docker_build.sh`, `Dockerfile` | the same build on a Mac through Docker (linux/amd64) |
 | `camera_flash.sh` | UART flash / verify / factory restore (writes only from 0x11000; the bootloader is never touched) |
@@ -53,13 +54,13 @@ git -C OpenBK7231T_App checkout 168cba55
 git -C OpenBK7231T_App submodule update --init sdk/beken_freertos_sdk libraries/berry
 git -C OpenBK7231T_App/sdk/beken_freertos_sdk checkout f5a64d4
 
-# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.4.7)
+# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.4.9)
 cd bk7252n-camera
-openbk-port/docker_build.sh 1.4.7        # -> build-openbk/OpenBK7252N_1.4.7_crc.bin and .rbl
+openbk-port/docker_build.sh 1.4.9        # -> build-openbk/OpenBK7252N_1.4.9_crc.bin and .rbl
 
 # flash over UART the first time (3.3 V adapter, camera on its battery), then OTA from the web page
 python3 -m venv .venv && .venv/bin/pip install -r tools/flasher/requirements.txt
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.7_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.9_crc.bin
 ```
 
 The build applies the patch to `OpenBK7231T_App` (it changes that checkout) and takes about a
@@ -82,3 +83,4 @@ logs contain Wi-Fi credentials and device keys.
 - OpenBeken and the Beken FreeRTOS SDK
 - `tools/flasher/`: Beken's UART download tool 
 - TJpgDec R0.03 by ChaN
+- FatFs R0.16 by ChaN (`openbk-port/fatfs/`)

@@ -39,6 +39,10 @@ else
     patch -d "$SRC" -p1 --forward < "$PATCH"
     echo "$PATCH_ID" > "$MARK"
 fi
+# ChaN's FatFs (read-only, obk_ prefixed) for the SD-card update; kept as plain files beside the
+# patch because it is large. Copied every time, so it always matches this repository.
+mkdir -p "$SRC/src/driver/fatfs"
+cp "$HERE"/fatfs/* "$SRC/src/driver/fatfs/"
 
 # 2. toolchain shipped with the SDK. Unpacked into a temporary folder first and moved into place
 # only when complete (a marker file records that), so an interrupted unpack is redone. The
@@ -75,11 +79,15 @@ fi
 # 4. build (the version also shows on the camera's web pages)
 echo "== building version $VER"
 printf '#define CAM_FW_TAG "fw %s"\n' "$VER" > "$SRC/src/driver/drv_bkCam_version.h"
+# The SDK's make does not track header dependencies: rebuild the files that show the version.
+touch "$SRC/src/driver/drv_bkCam.c" "$SRC/src/driver/drv_bkCamSd.c"
 rm -f "$SDK/out/bk7252n_UA.bin" "$SDK/out/app.rbl" "$SDK/out/bsp.bin"
 (cd "$SDK" && ARM_GCC_TOOLCHAIN="$SDK/toolchain/arm-none-eabi/bin/" sh build.sh bk7252n "$VER")
 # build.sh does not stop on a compile or link error: check that fresh images came out
 [ -s "$SDK/out/bk7252n_UA.bin" ] && [ -s "$SDK/out/app.rbl" ] \
     || { echo "== BUILD FAILED (no new out/bk7252n_UA.bin / out/app.rbl), see the errors above"; exit 1; }
+grep -q "fw $VER" "$SDK/out/bk7252n.elf" \
+    || { echo "== BUILD FAILED: the image does not contain the version string 'fw $VER'"; exit 1; }
 
 # 5. results
 mkdir -p "$OUT"

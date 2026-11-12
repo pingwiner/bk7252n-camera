@@ -1,12 +1,15 @@
 diff -ruN pa3/platforms/obk_main.mk pb3/platforms/obk_main.mk
 --- a/platforms/obk_main.mk	2026-11-09 17:39:46.926652299 +0400
-+++ b/platforms/obk_main.mk	2026-11-10 01:32:22.570381478 +0400
-@@ -82,6 +82,8 @@
++++ b/platforms/obk_main.mk	2026-11-12 21:12:00.287614592 +0400
+@@ -82,6 +82,11 @@
  OBKM_SRC  += $(OBK_SRCS)driver/drv_adcSmoother.c
  OBKM_SRC  += $(OBK_SRCS)driver/drv_aht2x.c
  OBKM_SRC  += $(OBK_SRCS)driver/drv_bkCharge.c
 +OBKM_SRC  += $(OBK_SRCS)driver/drv_bkCam.c
 +OBKM_SRC  += $(OBK_SRCS)driver/tjpgd/tjpgd.c
++OBKM_SRC  += $(OBK_SRCS)driver/drv_bkCamSd.c
++OBKM_SRC  += $(OBK_SRCS)driver/fatfs/ff.c
++OBKM_SRC  += $(OBK_SRCS)driver/fatfs/ffunicode.c
  OBKM_SRC  += $(OBK_SRCS)driver/drv_battery.c
  OBKM_SRC  += $(OBK_SRCS)driver/drv_bl0937.c
  OBKM_SRC  += $(OBK_SRCS)driver/drv_bl0942.c
@@ -563,8 +566,8 @@ diff -ruN pa3/src/driver/drv_audio.c pb3/src/driver/drv_audio.c
  	//cmddetail:"fn":"CMD_BKAudioOpen","file":"driver/drv_audio.c","requires":"",
 diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 --- a/src/driver/drv_bkCam.c	1970-01-01 04:00:00.000000000 +0400
-+++ b/src/driver/drv_bkCam.c	2026-11-10 15:55:36.635586292 +0400
-@@ -0,0 +1,1304 @@
++++ b/src/driver/drv_bkCam.c	2026-11-12 23:01:13.610860402 +0400
+@@ -0,0 +1,1318 @@
 +// BK7252N DVP camera (GC0329 on the security-camera board): JPEG frames from the on-chip encoder,
 +// served as /snapshot.jpg, an MJPEG /stream and a /cam page.
 +//
@@ -1672,7 +1675,7 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	if (!h.names)
 +		return CMD_RES_ERROR;
 +	if (!h.filter)
-+		ADDLOG_INFO(LOG_FEATURE_CMD, "Camera: CamInfo CamStart CamStop CamReg CamDump CamAudio CamMotion CamBattery PowerOff GpioWatch");
++		ADDLOG_INFO(LOG_FEATURE_CMD, "Camera: CamInfo CamStart CamStop CamReg CamDump CamAudio CamMotion CamBattery SdUpdate PowerOff GpioWatch");
 +	CMD_ListAllCommands(&h, Help_Add);
 +	qsort(h.names, h.count, sizeof(char *), Help_Cmp);
 +	for (i = 0; i < h.count; i++) {
@@ -1792,6 +1795,9 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +	return CMD_RES_OK;
 +}
 +
++int BKCam_SdUpdate(int mode, int verbose);
++void BKCam_SdUpdate_Register(void);
++
 +void BKCam_Init(void)
 +{
 +	// The camera board has no other control path during bring-up: accept console commands on
@@ -1833,6 +1839,17 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +		CMD_RegisterCommand("help", Cam_Cmd_Help, NULL);
 +	Btn_Start();
 +	Bat_Start();
++	// Firmware update from the microSD card, before the camera and Wi-Fi start (the battery check
++	// above has already put an empty camera back to sleep). Writing takes a few seconds.
++	BKCam_SdUpdate_Register();
++	if (!Bat_CutoffActive() || g_batMv >= g_batCutoff + 150) {
++		if (BKCam_SdUpdate(1, 0)) {
++			rtos_delay_milliseconds(300);
++			HAL_RebootModule();
++		}
++	} else {
++		ADDLOG_INFO(LOG_FEATURE_CMD, "SD update: skipped, battery %d mV is too low", g_batMv);
++	}
 +	// Discovery, so the camera can be found without the router's client list: mDNS answers
 +	// <short name>.local and announces an _http._tcp service (macOS/iOS/Windows/Linux, Android
 +	// service browsers); SSDP lists it under Network in Windows Explorer. Both wait for Wi-Fi.
@@ -1869,6 +1886,388 @@ diff -ruN pa3/src/driver/drv_bkCam.c pb3/src/driver/drv_bkCam.c
 +}
 +
 +#endif // ENABLE_DRIVER_BKCAM
+diff -ruN pa3/src/driver/drv_bkCamSd.c pb3/src/driver/drv_bkCamSd.c
+--- a/src/driver/drv_bkCamSd.c	1970-01-01 04:00:00.000000000 +0400
++++ b/src/driver/drv_bkCamSd.c	2026-11-12 23:01:13.609800577 +0400
+@@ -0,0 +1,378 @@
++// BK7252N camera: firmware update from the microSD card.
++//
++// At boot (and with the SdUpdate command) the camera looks in the root folder of a FAT32 or exFAT
++// card for OpenBK7252N*.rbl - the same OTA package the build makes for Wi-Fi updates. A package
++// whose header is intact, whose CRC32 matches and whose version is newer than the running
++// firmware is copied into the download area (0x132000), exactly where a Wi-Fi OTA puts it; the
++// camera reboots and the unchanged factory bootloader checks it again and installs it. The
++// bootloader itself is never touched, and a bad card or file only means "no update".
++//
++// Reboot-loop guard: a short hash of the package header is kept in retained channel 5 while an
++// install is in progress. If the camera comes back still older than that same package (the
++// bootloader refused it), the package is not tried again until a different file is put on the card.
++#include "../obk_config.h"
++#if ENABLE_DRIVER_BKCAM
++#include "../new_common.h"
++#include "../new_cfg.h"
++#include "../cmnds/cmd_public.h"
++#include "../logging/logging.h"
++#include "../hal/hal_generic.h"
++#include "../hal/hal_flashVars.h"
++#include "include.h"
++#include "rtos_pub.h"
++#include "mem_pub.h"
++#include "fatfs/ff.h"
++#include "fatfs/diskio.h"
++#if __has_include("drv_bkCam_version.h")
++#include "drv_bkCam_version.h"
++#endif
++
++#ifndef CAM_FW_TAG
++#define CAM_FW_TAG "fw dev"
++#endif
++
++// Beken SDK SD card driver (driver/sd_card/sd_card_driver.c)
++extern int bk_sdio_host_driver_init(void);
++extern int bk_sd_card_init(void);
++extern int bk_sd_card_deinit(void);
++extern int bk_sd_card_read_blocks(uint8_t *data, uint32_t block_addr, uint32_t block_num);
++extern uint32_t bk_sd_card_get_card_size(void);
++// hal_ota_bk7231.c (the Wi-Fi OTA writer)
++extern int init_ota(unsigned int startaddr);
++extern void add_otadata(unsigned char *data, int len);
++extern void close_ota(void);
++extern int HAL_FlashRead(char *buffer, int readlen, int startaddr);
++
++#define SDU_OTA_ADDR      0x132000
++#define SDU_OTA_MAX       (0x1E0000 - 0x132000)    // download area ends below the RF calibration sector
++#define SDU_GUARD_CH      5
++#define SDU_HDR_SIZE      96
++#define SDU_PREFIX        "openbk7252n"
++#define SDU_CHUNK         4096
++
++#define SDU_LOG(...)      ADDLOG_INFO(LOG_FEATURE_CMD, __VA_ARGS__)
++
++// ---------------------------------------------------------------- FatFs disk glue (drive 0 = SD)
++static int s_sdInit;
++
++DSTATUS disk_status(BYTE pdrv) { return (pdrv == 0 && s_sdInit) ? 0 : STA_NOINIT; }
++
++DSTATUS disk_initialize(BYTE pdrv)
++{
++	if (pdrv != 0)
++		return STA_NOINIT;
++	if (!s_sdInit && bk_sdio_host_driver_init() == 0 && bk_sd_card_init() == 0)
++		s_sdInit = 1;
++	return s_sdInit ? 0 : STA_NOINIT;
++}
++
++DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count)
++{
++	if (pdrv != 0 || !s_sdInit)
++		return RES_NOTRDY;
++	return bk_sd_card_read_blocks(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
++}
++
++DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
++{
++	if (pdrv != 0 || !s_sdInit)
++		return RES_NOTRDY;
++	switch (cmd) {
++	case CTRL_SYNC: return RES_OK;
++	case GET_SECTOR_COUNT: *(LBA_t *)buff = bk_sd_card_get_card_size(); return RES_OK;
++	case GET_SECTOR_SIZE: *(WORD *)buff = 512; return RES_OK;
++	case GET_BLOCK_SIZE: *(DWORD *)buff = 1; return RES_OK;
++	}
++	return RES_PARERR;
++}
++
++// ---------------------------------------------------------------- helpers
++static uint32_t Sdu_Crc32(uint32_t crc, const uint8_t *p, int n)
++{
++	static const uint32_t t[16] = {
++		0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC, 0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
++		0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C, 0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C };
++	crc = ~crc;
++	while (n--) {
++		crc ^= *p++;
++		crc = (crc >> 4) ^ t[crc & 15];
++		crc = (crc >> 4) ^ t[crc & 15];
++	}
++	return ~crc;
++}
++
++static uint32_t Sdu_U32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
++
++// "1.4.7" -> {1,4,7,0}; returns the number of parts read (0 = not a version)
++static int Sdu_ParseVer(const char *s, int v[4])
++{
++	int n = 0;
++	v[0] = v[1] = v[2] = v[3] = 0;
++	while (*s == ' ' || *s == 'v' || *s == 'V') s++;
++	while (n < 4 && *s >= '0' && *s <= '9') {
++		int x = 0;
++		while (*s >= '0' && *s <= '9') x = x * 10 + (*s++ - '0');
++		v[n++] = x;
++		if (*s != '.') break;
++		s++;
++	}
++	return n;
++}
++
++static int Sdu_CmpVer(const int a[4], const int b[4])
++{
++	for (int i = 0; i < 4; i++)
++		if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
++	return 0;
++}
++
++static int Sdu_RunningVer(int v[4])
++{
++	const char *t = CAM_FW_TAG;
++	if (!strncmp(t, "fw ", 3)) t += 3;
++	return Sdu_ParseVer(t, v);
++}
++
++static int Sdu_HasPrefixRbl(const char *name)
++{
++	int n = strlen(name);
++	if (n < 4 || wal_strnicmp(name, SDU_PREFIX, strlen(SDU_PREFIX)) || stricmp(name + n - 4, ".rbl"))
++		return 0;
++	return 1;
++}
++
++typedef struct {
++	FATFS fs;
++	FIL fil;
++	DIR dir;
++	FILINFO fno;
++	uint8_t hdr[SDU_HDR_SIZE];
++	uint8_t buf[SDU_CHUNK];
++	char best[FF_MAX_LFN + 2];
++	char bestVer[25];
++	uint32_t bestSize, bestHdrCrc;
++	int bestV[4];
++} sdu_ctx_t;
++
++// Header checks; on success fills ver (text) and v. Returns NULL or the reason it was refused.
++static const char *Sdu_CheckHeader(const uint8_t *h, uint32_t fileSize, char ver[25], int v[4])
++{
++	if (memcmp(h, "RBL", 4))
++		return "not an RBL package";
++	if (Sdu_Crc32(0, h, 92) != Sdu_U32(h + 92))
++		return "header CRC wrong";
++	if (strncmp((const char *)h + 12, "app", 16))
++		return "not an app package";
++	memcpy(ver, h + 28, 24);
++	ver[24] = 0;
++	if (!Sdu_ParseVer(ver, v))
++		return "no version in header";
++	uint32_t pkg = Sdu_U32(h + 88);
++	if (pkg == 0 || SDU_HDR_SIZE + pkg != fileSize)
++		return "size does not match header";
++	if (fileSize > SDU_OTA_MAX)
++		return "too big for the download area";
++	return NULL;
++}
++
++// CRC32 of the package body (after the header) straight from the card
++static int Sdu_CheckBody(sdu_ctx_t *c, const char *name)
++{
++	UINT br;
++	uint32_t crc = 0, left;
++	if (f_open(&c->fil, name, FA_READ) != FR_OK)
++		return 0;
++	if (f_read(&c->fil, c->hdr, SDU_HDR_SIZE, &br) != FR_OK || br != SDU_HDR_SIZE) {
++		f_close(&c->fil);
++		return 0;
++	}
++	left = c->bestSize - SDU_HDR_SIZE;
++	while (left) {
++		UINT n = left > SDU_CHUNK ? SDU_CHUNK : left;
++		if (f_read(&c->fil, c->buf, n, &br) != FR_OK || br != n)
++			break;
++		crc = Sdu_Crc32(crc, c->buf, n);
++		left -= n;
++		HAL_Run_WDT();
++	}
++	f_close(&c->fil);
++	return left == 0 && crc == Sdu_U32(c->hdr + 76);
++}
++
++// Copy the package into the download area (as the Wi-Fi OTA does), then read it back and compare.
++static int Sdu_Install(sdu_ctx_t *c)
++{
++	UINT br;
++	uint32_t crcFile = 0, crcFlash = 0, done = 0;
++	if (f_open(&c->fil, c->best, FA_READ) != FR_OK)
++		return 0;
++	if (!init_ota(SDU_OTA_ADDR)) {
++		f_close(&c->fil);
++		return 0;
++	}
++	while (done < c->bestSize) {
++		UINT n = (c->bestSize - done) > SDU_CHUNK ? SDU_CHUNK : (c->bestSize - done);
++		if (f_read(&c->fil, c->buf, n, &br) != FR_OK || br != n)
++			break;
++		crcFile = Sdu_Crc32(crcFile, c->buf, n);
++		add_otadata(c->buf, n);
++		done += n;
++		HAL_Run_WDT();
++	}
++	close_ota();
++	f_close(&c->fil);
++	if (done != c->bestSize) {
++		SDU_LOG("SD update: read error at %u of %u bytes", done, c->bestSize);
++		return 0;
++	}
++	for (uint32_t a = 0; a < c->bestSize; a += SDU_CHUNK) {
++		int n = (c->bestSize - a) > SDU_CHUNK ? SDU_CHUNK : (c->bestSize - a);
++		HAL_FlashRead((char *)c->buf, n, SDU_OTA_ADDR + a);
++		crcFlash = Sdu_Crc32(crcFlash, c->buf, n);
++		HAL_Run_WDT();
++	}
++	if (crcFlash != crcFile) {
++		SDU_LOG("SD update: download area does not match the file (CRC %08x vs %08x)", crcFlash, crcFile);
++		return 0;
++	}
++	return 1;
++}
++
++static short Sdu_GuardHash(uint32_t hdrCrc)
++{
++	short h = (short)((hdrCrc ^ (hdrCrc >> 16)) & 0x7FFF);
++	return h ? h : 1;
++}
++
++// mode: 0 = report only, 1 = install if newer (boot), 2 = install even if not newer (SdUpdate force)
++// Returns 1 if a package was written (the caller reboots).
++int BKCam_SdUpdate(int mode, int verbose)
++{
++	int cur[4], haveCur = Sdu_RunningVer(cur);
++	int ret = 0, found = 0;
++	sdu_ctx_t *c = os_malloc(sizeof(sdu_ctx_t));
++	if (!c)
++		return 0;
++	memset(c, 0, sizeof(*c));
++	FRESULT fr = f_mount(&c->fs, "", 1);
++	if (fr != FR_OK) {
++		if (verbose || mode)
++			SDU_LOG("SD update: no card or no FAT32/exFAT file system (%s, err %d)",
++				s_sdInit ? "card found" : "no card answered", fr);
++		goto out;
++	}
++	if (verbose || mode)
++		SDU_LOG("SD card: %u MB, %s, running %s", (unsigned)(bk_sd_card_get_card_size() / 2048),
++			c->fs.fs_type == FS_EXFAT ? "exFAT" : c->fs.fs_type == FS_FAT32 ? "FAT32" : "FAT12/16", CAM_FW_TAG);
++	if (f_opendir(&c->dir, "/") == FR_OK) {
++		while (f_readdir(&c->dir, &c->fno) == FR_OK && c->fno.fname[0]) {
++			char ver[25];
++			int v[4];
++			UINT br;
++			if (c->fno.fattrib & AM_DIR)
++				continue;
++			if (!Sdu_HasPrefixRbl(c->fno.fname)) {
++				if (verbose)
++					SDU_LOG("  %s (%u bytes)", c->fno.fname, (unsigned)c->fno.fsize);
++				continue;
++			}
++			const char *why = "cannot read";
++			if (f_open(&c->fil, c->fno.fname, FA_READ) == FR_OK) {
++				if (f_read(&c->fil, c->hdr, SDU_HDR_SIZE, &br) == FR_OK && br == SDU_HDR_SIZE)
++					why = Sdu_CheckHeader(c->hdr, (uint32_t)c->fno.fsize, ver, v);
++				f_close(&c->fil);
++			}
++			if (why) {
++				SDU_LOG("  %s: ignored, %s", c->fno.fname, why);
++				continue;
++			}
++			if (verbose)
++				SDU_LOG("  %s: package %s, %u bytes", c->fno.fname, ver, (unsigned)c->fno.fsize);
++			if (!found || Sdu_CmpVer(v, c->bestV) > 0) {
++				found = 1;
++				strncpy(c->best, c->fno.fname, sizeof(c->best) - 1);
++				strcpy(c->bestVer, ver);
++				memcpy(c->bestV, v, sizeof(v));
++				c->bestSize = (uint32_t)c->fno.fsize;
++				c->bestHdrCrc = Sdu_U32(c->hdr + 92);
++			}
++		}
++		f_closedir(&c->dir);
++	}
++	short guard = (short)HAL_FlashVars_GetChannelValue(SDU_GUARD_CH);
++	if (!found) {
++		if (verbose || mode)
++			SDU_LOG("SD update: no OpenBK7252N*.rbl package in the card's root folder");
++		goto clear_guard;
++	}
++	int newer = haveCur && Sdu_CmpVer(c->bestV, cur) > 0;
++	short hash = Sdu_GuardHash(c->bestHdrCrc);
++	if (!newer && mode != 2) {
++		if (verbose || mode)
++			SDU_LOG("SD update: %s is %s, running %s - nothing to do%s", c->best, c->bestVer, CAM_FW_TAG,
++				haveCur ? "" : " (running version unknown: use SdUpdate force)");
++		goto clear_guard;
++	}
++	if (mode == 1 && guard == hash) {
++		SDU_LOG("SD update: %s was already installed once and the camera still runs %s; not retrying "
++			"(put a different file on the card, or use SdUpdate force)", c->best, CAM_FW_TAG);
++		goto out;
++	}
++	if (mode == 0) {
++		SDU_LOG("SD update: would install %s (%s) - SdUpdate install to do it now, or reboot", c->best, c->bestVer);
++		goto out;
++	}
++	SDU_LOG("SD update: checking %s (%s)...", c->best, c->bestVer);
++	if (!Sdu_CheckBody(c, c->best)) {
++		SDU_LOG("SD update: %s is damaged (body CRC wrong) - ignored", c->best);
++		goto out;
++	}
++	SDU_LOG("SD update: writing %s to the download area, do not remove power", c->bestVer);
++	HAL_FlashVars_SaveChannel(SDU_GUARD_CH, hash);
++	if (Sdu_Install(c)) {
++		CFG_IncrementOTACount();
++		SDU_LOG("SD update: %s ready, rebooting; the bootloader installs it (about 20 s)", c->bestVer);
++		ret = 1;
++	}
++	goto out;
++clear_guard:
++	if (guard != 0)
++		HAL_FlashVars_SaveChannel(SDU_GUARD_CH, 0);
++out:
++	f_mount(NULL, "", 0);
++	if (s_sdInit) {
++		bk_sd_card_deinit();
++		s_sdInit = 0;
++	}
++	os_free(c);
++	return ret;
++}
++
++// SdUpdate            -> show the card contents and what would happen
++// SdUpdate install    -> install a newer package now
++// SdUpdate force      -> install the newest package even if it is not newer
++static commandResult_t Sdu_Cmd(const void *context, const char *cmd, const char *args, int flags)
++{
++	int mode = 0;
++	Tokenizer_TokenizeString(args, 0);
++	if (Tokenizer_GetArgsCount() >= 1) {
++		const char *a = Tokenizer_GetArg(0);
++		if (!stricmp(a, "install")) mode = 1;
++		else if (!stricmp(a, "force")) mode = 2;
++		else return CMD_RES_BAD_ARGUMENT;
++	}
++	if (mode == 1)
++		HAL_FlashVars_SaveChannel(SDU_GUARD_CH, 0);    // an explicit request may retry
++	if (BKCam_SdUpdate(mode, 1)) {
++		rtos_delay_milliseconds(500);
++		HAL_RebootModule();
++	}
++	return CMD_RES_OK;
++}
++
++void BKCam_SdUpdate_Register(void)
++{
++	//cmddetail:{"name":"SdUpdate","args":"[install|force]","descr":"Firmware update from the microSD card (OpenBK7252N*.rbl in the root folder): show, install if newer, or install anyway","fn":"Sdu_Cmd","file":"driver/drv_bkCamSd.c","requires":"","examples":"SdUpdate install"}
++	CMD_RegisterCommand("SdUpdate", Sdu_Cmd, NULL);
++}
++#endif
 diff -ruN pa3/src/driver/drv_local.h pb3/src/driver/drv_local.h
 --- a/src/driver/drv_local.h	2026-11-09 17:39:46.850285486 +0400
 +++ b/src/driver/drv_local.h	2026-11-10 01:32:22.621493204 +0400

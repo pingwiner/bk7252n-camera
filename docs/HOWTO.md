@@ -41,17 +41,17 @@ git submodule update --init sdk/beken_freertos_sdk libraries/berry   # Beken SDK
 
 ```sh
 cd ~/cam/bk7252n-camera/openbk-port
-./docker_build.sh 1.4.7          # pick a new version number each time
+./docker_build.sh 1.4.9          # pick a new version number each time
 ```
 
 The first run also builds the Docker image, which takes a few minutes. The results are:
 
 ```
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.7_crc.bin   UART image (0x121000 bytes), flash at 0x11000
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.7.rbl       OTA package (~500 KB)
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.9_crc.bin   UART image (0x121000 bytes), flash at 0x11000
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.4.9.rbl       OTA package (~500 KB)
 ```
 
-The version also appears on the camera's main page and `/cam` page as "fw 1.4.7", so you can see
+The version also appears on the camera's main page and `/cam` page as "fw 1.4.9", so you can see
 which build is running.
 
 ### Build on x86-64 Linux
@@ -59,7 +59,7 @@ which build is running.
 You need `make`, `python3`, `patch` and `xz`. Then:
 
 ```sh
-sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.4.7
+sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.4.9
 ```
 
 ### What the build script does
@@ -70,7 +70,8 @@ sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.4
    **This changes your checkout.**
 2. Unpacks the SDK's toolchain (`sdk/beken_freertos_sdk/toolchain/arm-none-eabi-gcc.tar.xz`).
 3. Generates the Berry scripting sources (`libraries/berry/generate`).
-4. Runs `sh build.sh bk7252n <version>` in the SDK, then copies `out/bk7252n_UA.bin` and
+4. Copies `openbk-port/fatfs/` (FatFs, used by the SD-card update) to `src/driver/fatfs/`.
+5. Runs `sh build.sh bk7252n <version>` in the SDK, then copies `out/bk7252n_UA.bin` and
    `out/app.rbl` to `build-openbk/`.
 
 To work on the code, edit the files in `OpenBK7231T_App` and rebuild. The camera driver is
@@ -97,6 +98,36 @@ copies it to the app partition. Settings, including your Wi-Fi, are kept.
 If an update doesn't come back up, flash the matching `*_crc.bin` over UART (section 3). Keep the
 `*_crc.bin` of every version you install.
 
+### Update from a microSD card
+
+No network needed, e.g. for a camera that lost its Wi-Fi settings or sits somewhere awkward.
+
+1. Format a microSD card as **FAT32 or exFAT** (most cards come that way).
+2. Copy `OpenBK7252N_<version>.rbl` into the card's root folder. Keep the name: it must start with
+   `OpenBK7252N` and end in `.rbl`.
+3. Put the card in the camera and switch it on (or reboot it).
+
+At every start the camera looks at the card before it starts the camera and Wi-Fi. If the newest
+package there is **newer** than the running version, it checks the package (header CRC, version,
+size, CRC32 of the whole body), copies it into the download partition exactly like a Wi-Fi update,
+reads it back to compare, and reboots; the factory bootloader then installs it. That takes a few
+seconds plus the usual bootloader time. Older or equal versions, other files and damaged
+packages are ignored, so the card can stay in. With a nearly empty battery (less than 150 mV above
+the cut-off) the check is skipped.
+
+If the bootloader refuses a package and the camera comes back on the old version, that same file
+is not tried again (a hash of it is kept in retained channel 5) until a different file is put on
+the card or `SdUpdate install` is run.
+
+| Command | |
+|---|---|
+| `SdUpdate` | show the card (size, file system, files, packages) and what would happen |
+| `SdUpdate install` | install a newer package now |
+| `SdUpdate force` | install the newest package even if it is not newer (downgrade) |
+
+The card is read in 1-bit SD mode on GPIO14–19 (the SoC's SD host); FatFs R0.16 by ChaN,
+read-only, is built in for this (`openbk-port/fatfs/`).
+
 ## 3. Flash over UART (first install or recovery)
 
 ### Wiring
@@ -111,7 +142,7 @@ If an update doesn't come back up, flash the matching `*_crc.bin` over UART (sec
 
 ```sh
 cd ~/cam/bk7252n-camera
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.7_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.4.9_crc.bin
 ```
 
 0. **First time only: backup.** If `backups/` has no backup of this camera yet, the script first
@@ -146,9 +177,9 @@ With the Arduino relay on `/dev/cu.usbserial-140` and the agent running
 typing commands. Drop JSON files into `lab/jobs/`, for example:
 
 ```json
-{"action": "flash", "image": "build-openbk/OpenBK7252N_1.4.7_crc.bin"}
+{"action": "flash", "image": "build-openbk/OpenBK7252N_1.4.9_crc.bin"}
 {"action": "cycle_capture", "seconds": 30, "off_s": 3}
-{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.4.7_crc.bin"]}
+{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.4.9_crc.bin"]}
 ```
 
 Results appear in `lab/results/`. The agent power-cycles the camera into the bootloader itself and
@@ -240,6 +271,7 @@ command line:
 | `CamBattery` | battery voltage, percent, raw ADC value, scale and cut-off |
 | `CamBattery cal <mV>` | calibrate against a multimeter reading taken right now |
 | `CamBattery cutoff <mV>` | low-battery deep-sleep threshold (default 3450, `0` = off) |
+| `SdUpdate [install\|force]` | firmware update from the microSD card (section 2) |
 | `GpioWatch <seconds> [probe]` | log GPIO input changes (how the buttons were found) |
 
 ### Microphone
@@ -330,7 +362,7 @@ bootloader stays untouched.
 |---|---|
 | 0x000000–0x010FFF | factory bootloader `BK7252N_1.0.14`, never written |
 | 0x011000–0x131FFF | app: OpenBeken + camera, CRC-wrapped (`*_crc.bin`) |
-| 0x132000–0x1DFFFF | OTA download partition (`*.rbl` lands here) |
+| 0x132000–0x1DFFFF | OTA download partition (`*.rbl` lands here, from Wi-Fi or the SD card) |
 | 0x1E0000 | RF calibration |
 | 0x1E1000 | OpenBeken settings (NET_PARAM) |
 | 0x1E5000–0x1ECFFF | OpenBeken flash variables |
