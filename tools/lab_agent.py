@@ -289,6 +289,37 @@ def job_flash_info(name, job):
     run_writer(name, ["info", CAM_PORT], "flash info (read-only)")
 
 
+def job_http(name, job):
+    """HTTP request to the camera on the local network (API tests); response saved as the result."""
+    import ipaddress
+    import urllib.parse
+    import urllib.request
+    url = str(job["url"])
+    u = urllib.parse.urlparse(url)
+    host = u.hostname or ""
+    try:
+        local = ipaddress.ip_address(host).is_private
+    except ValueError:
+        local = host.endswith(".local")
+    if u.scheme != "http" or not local:
+        raise ValueError("http job: only http:// to a private address or a .local name")
+    data = job.get("body")
+    req = urllib.request.Request(url, data=data.encode() if data is not None else None,
+                                 method=job.get("method", "POST" if data is not None else "GET"))
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    lines = [f"{req.get_method()} {url}"]
+    try:
+        with urllib.request.urlopen(req, timeout=float(job.get("timeout", 10))) as r:
+            body = r.read(65536)
+            lines.append(f"status {r.status} {r.headers.get('Content-Type')} {len(body)} bytes")
+    except urllib.error.HTTPError as e:
+        body = e.read(65536)
+        lines.append(f"status {e.code}")
+    lines.append(body.decode("utf-8", "replace"))
+    (RESULTS / f"{name}.log").write_text("\n".join(lines) + "\n")
+
+
 def job_ports(name, job):
     """Read-only: list the Mac's serial ports (to spot a swapped camera / relay adapter)."""
     from serial.tools import list_ports
@@ -300,7 +331,7 @@ def job_ports(name, job):
 
 ACTIONS = {"ports": job_ports, "power": job_power, "cycle_capture": job_cycle_capture, "capture": job_capture,
            "send": job_send, "flash": job_flash, "flash_info": job_flash_info,
-           "flash_verify": job_flash_verify, "flash_read": job_flash_read, "flash_read_manual": job_flash_read_manual}
+           "flash_verify": job_flash_verify, "http": job_http, "flash_read": job_flash_read, "flash_read_manual": job_flash_read_manual}
 
 
 def main() -> None:
