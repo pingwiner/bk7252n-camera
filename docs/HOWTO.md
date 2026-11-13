@@ -41,17 +41,17 @@ git submodule update --init sdk/beken_freertos_sdk libraries/berry   # Beken SDK
 
 ```sh
 cd ~/cam/bk7252n-camera/openbk-port
-./docker_build.sh 1.5.2          # pick a new version number each time
+./docker_build.sh 1.5.4          # pick a new version number each time
 ```
 
 The first run also builds the Docker image, which takes a few minutes. The results are:
 
 ```
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.2_crc.bin   UART image (0x121000 bytes), flash at 0x11000
-~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.2.rbl       OTA package (~500 KB)
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.4_crc.bin   UART image (0x121000 bytes), flash at 0x11000
+~/cam/bk7252n-camera/build-openbk/OpenBK7252N_1.5.4.rbl       OTA package (~500 KB)
 ```
 
-The version also appears on the camera's main page and `/cam` page as "fw 1.5.2", so you can see
+The version also appears on the camera's main page and `/cam` page as "fw 1.5.4", so you can see
 which build is running.
 
 ### Build on x86-64 Linux
@@ -59,7 +59,7 @@ which build is running.
 You need `make`, `python3`, `patch` and `xz`. Then:
 
 ```sh
-sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.5.2
+sh ~/cam/bk7252n-camera/openbk-port/build_camera_fw.sh ~/cam/OpenBK7231T_App 1.5.4
 ```
 
 ### What the build script does
@@ -142,7 +142,7 @@ is built in for this and for the motion pictures (`openbk-port/fatfs/`).
 
 ```sh
 cd ~/cam/bk7252n-camera
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.2_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.4_crc.bin
 ```
 
 0. **First time only: backup.** If `backups/` has no backup of this camera yet, the script first
@@ -177,9 +177,9 @@ With the Arduino relay on `/dev/cu.usbserial-140` and the agent running
 typing commands. Drop JSON files into `lab/jobs/`, for example:
 
 ```json
-{"action": "flash", "image": "build-openbk/OpenBK7252N_1.5.2_crc.bin"}
+{"action": "flash", "image": "build-openbk/OpenBK7252N_1.5.4_crc.bin"}
 {"action": "cycle_capture", "seconds": 30, "off_s": 3}
-{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.5.2_crc.bin"]}
+{"action": "flash_verify", "images": ["build-openbk/OpenBK7252N_1.5.4_crc.bin"]}
 ```
 
 Results appear in `lab/results/`. The agent power-cycles the camera into the bootloader itself and
@@ -275,6 +275,7 @@ command line:
 | `SdUpdate [install\|force]` | firmware update from the microSD card (section 2) |
 | `CamRec [on\|off\|seconds]` | motion pictures on the SD card |
 | `CamTimezone [+hh:mm]` | time zone for picture names |
+| `CamLog [on\|off]` | console log on the SD card (off by default) |
 | `GpioWatch <seconds> [probe]` | log GPIO input changes (how the buttons were found) |
 
 ### Microphone
@@ -332,6 +333,26 @@ pictures: the first frame as soon as motion is detected, then one every 2 s whil
 | `CamRec off` / `CamRec on` | stop / start saving pictures (kept in retained channel 3) |
 | `CamRec <seconds>` | one picture every `<seconds>` while motion lasts; `0` = only the first picture of each event |
 | `CamTimezone [+hh:mm]` | show or set the time zone used for the picture names |
+
+### Console log on the SD card
+
+Everything the camera prints on the UART console (OpenBeken's log and the Beken SDK's own
+messages) can also be written to the card. It is **off by default**; turn it on with the
+**SD log** checkbox on `/cam` or `CamLog on` (kept in retained channel 1).
+
+- A copy of the console output is kept in an 8 KB buffer from the moment the camera starts and
+  appended to the card every 5 s (sooner when a lot comes in), so a log includes the start-up.
+- Files: `LOGS/<yyyy-mm-dd>.log`, or `LOGS/B<boot number>.log` before the clock has synced; a file
+  continues in `_2.log`, `_3.log` .. after 8 MB. The oldest logs are deleted when `LOGS` gets
+  bigger than 16 MB or 5 % of the card.
+- If text comes faster than it can be written (or there is no card), the file gets a
+  `[SD log: N bytes lost]` line instead of silent gaps.
+- The `/motion` page lists the logs; they open as plain text.
+
+| Command | |
+|---|---|
+| `CamLog` | status: on/off, current file, bytes written and lost |
+| `CamLog on` / `CamLog off` | start / stop the SD log |
 
 The card stays mounted while the camera runs. If it is pulled out, writes fail and the camera
 tries to mount it again every 30 s.

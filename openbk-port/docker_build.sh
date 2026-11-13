@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the camera firmware on a Mac (or any Docker host) in an x86-64 Linux container.
-#   ./docker_build.sh 1.5.2
+#   ./docker_build.sh 1.5.4
 # OpenBeken sources: $OBK, default ../../OpenBK7231T_App (next to this repository).
 # Output: build-openbk/ in this repository.
 set -eu

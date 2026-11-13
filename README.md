@@ -16,7 +16,7 @@ Local, cloud-free firmware for a Wi-Fi security camera built on the **Beken BK72
 | **Buttons** | Power: hold 2 s = off / on. Mode: hold 2 s = forget Wi-Fi and open the setup access point |
 | **Network** | joins your Wi-Fi; found as `http://<short name>.local` (mDNS); setup page tells the user where to find it |
 | **Updates** | OTA over Wi-Fi or from a microSD card (newer `OpenBK7252N*.rbl` in the root folder, installed at boot), both through the factory bootloader; UART flashing for first install and recovery |
-| **Consoles** | UART (115200) and TCP port 100 (flag 5), `help [text]` lists commands |
+| **Consoles** | UART (115200) and TCP port 100 (flag 5), `help [text]` lists commands; optional copy of the console log on the SD card |
 | **MAC** | the camera's own MAC from the factory config sector instead of the SDK's shared default |
 
 OpenBeken settings pages that do nothing on a camera (pins, start values, device groups, MAC,
@@ -54,13 +54,13 @@ git -C OpenBK7231T_App checkout 168cba55
 git -C OpenBK7231T_App submodule update --init sdk/beken_freertos_sdk libraries/berry
 git -C OpenBK7231T_App/sdk/beken_freertos_sdk checkout f5a64d4
 
-# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.5.2)
+# build: Mac / Docker (on x86-64 Linux: sh openbk-port/build_camera_fw.sh ../OpenBK7231T_App 1.5.4)
 cd bk7252n-camera
-openbk-port/docker_build.sh 1.5.2        # -> build-openbk/OpenBK7252N_1.5.2_crc.bin and .rbl
+openbk-port/docker_build.sh 1.5.4        # -> build-openbk/OpenBK7252N_1.5.4_crc.bin and .rbl
 
 # flash over UART the first time (3.3 V adapter, camera on its battery), then OTA from the web page
 python3 -m venv .venv && .venv/bin/pip install -r tools/flasher/requirements.txt
-BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.2_crc.bin
+BAUD=115200 ./camera_flash.sh flash build-openbk/OpenBK7252N_1.5.4_crc.bin
 ```
 
 The build applies the patch to `OpenBK7231T_App` (it changes that checkout) and takes about a
